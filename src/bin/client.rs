@@ -1,4 +1,4 @@
-use kv_store::framing::{FrameDecoder, encode_frame};
+use kv_store::net::framing::{FrameDecoder, encode_frame};
 use std::io::{self, BufRead, Write};
 use std::net::TcpStream;
 

@@ -1,6 +1,6 @@
 use std::io;
 
-use crate::replication_log::{LogEntry, ReplicationEntry};
+use crate::replication::log::{LogEntry, ReplicationEntry};
 
 const MAX_MESSAGE_SIZE: usize = 1024 * 1024;
 const SNAPSHOT_CHUNK_OVERHEAD: usize = 1 + 8 + 4 + 4;

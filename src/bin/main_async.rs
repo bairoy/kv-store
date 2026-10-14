@@ -3,8 +3,8 @@ use std::sync::Arc;
 
 use tokio::net::TcpListener;
 
-use kv_store::async_server::handle_connection;
-use kv_store::sharded_store::ShardedStore;
+use kv_store::legacy::async_server::handle_connection;
+use kv_store::legacy::sharded_store::ShardedStore;
 
 #[tokio::main]
 async fn main() -> io::Result<()> {

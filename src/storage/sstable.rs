@@ -1,6 +1,6 @@
-use crate::bloom_filter::BloomFilter;
-use crate::memtable::Memtable;
-use crate::sparse_index::SparseIndex;
+use crate::storage::bloom_filter::BloomFilter;
+use crate::storage::memtable::Memtable;
+use crate::storage::sparse_index::SparseIndex;
 
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, BufWriter, Seek, SeekFrom, Write};

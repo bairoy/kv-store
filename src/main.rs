@@ -1,5 +1,5 @@
-use kv_store::server::handle_connection;
-use kv_store::store::Store;
+use kv_store::legacy::server::handle_connection;
+use kv_store::legacy::store::Store;
 use std::io;
 use std::net::TcpListener;
 use std::sync::{Arc, Mutex};
