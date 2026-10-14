@@ -1,0 +1,13 @@
+/target
+.DS_Store
+.env
+
+# runtime data produced by servers/tests
+*.log
+*.offset
+*.db
+*.marker
+*_sstables/
+
+# reference material
+*.pdf
