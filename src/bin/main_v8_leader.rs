@@ -1,9 +1,9 @@
 use std::io;
 use std::path::Path;
 
-use kv_store::storage::lsm::LsmStore;
-use kv_store::replication::log::ReplicationLog;
 use kv_store::replication::leader::{Leader, run_client_server, run_replication_server};
+use kv_store::replication::log::ReplicationLog;
+use kv_store::storage::lsm::LsmStore;
 
 #[tokio::main]
 async fn main() -> io::Result<()> {

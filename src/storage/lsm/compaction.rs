@@ -141,7 +141,11 @@ impl LsmStore {
         self.sstable_dir.join(COMPACTION_MARKER)
     }
 
-    pub(super) fn write_compaction_marker(&self, new_name: &str, old_names: &[String]) -> io::Result<()> {
+    pub(super) fn write_compaction_marker(
+        &self,
+        new_name: &str,
+        old_names: &[String],
+    ) -> io::Result<()> {
         let marker_path = self.marker_path();
         let temp_path = self.sstable_dir.join("compaction.marker.tmp");
 

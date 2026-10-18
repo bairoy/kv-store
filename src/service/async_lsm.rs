@@ -1,6 +1,6 @@
 use crate::net::framing::{FrameDecoder, encode_frame};
-use crate::storage::lsm::LsmStore;
 use crate::net::protocol::{Command, Response, encode_response, parse_request};
+use crate::storage::lsm::LsmStore;
 
 use std::io;
 use std::sync::Arc;

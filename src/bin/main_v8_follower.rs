@@ -1,5 +1,5 @@
-use kv_store::storage::lsm::LsmStore;
 use kv_store::replication::follower::Follower;
+use kv_store::storage::lsm::LsmStore;
 use std::io;
 
 #[tokio::main]

@@ -1,6 +1,6 @@
+use crate::legacy::store::Store;
 use crate::net::framing::{FrameDecoder, encode_frame};
 use crate::net::protocol::{Command, Response, encode_response, parse_request};
-use crate::legacy::store::Store;
 use std::io::{self, Write};
 use std::net::TcpStream;
 use std::sync::{Arc, Mutex};

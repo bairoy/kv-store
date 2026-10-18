@@ -1,8 +1,8 @@
 use std::io;
 use std::sync::{Arc, Mutex};
 
-use kv_store::storage::lsm::LsmStore;
 use kv_store::service::async_lsm::handle_connection;
+use kv_store::storage::lsm::LsmStore;
 
 use tokio::net::TcpListener;
 

@@ -23,7 +23,6 @@ pub struct LsmStore {
     next_sstable_id: usize,
 }
 
-
 impl LsmStore {
     pub fn open(sstable_dir: impl AsRef<Path>, wal_path: impl AsRef<Path>) -> io::Result<Self> {
         let sstable_dir = sstable_dir.as_ref().to_path_buf();

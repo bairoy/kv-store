@@ -3,7 +3,11 @@ use std::io::{self, BufRead, Write};
 use std::net::TcpStream;
 
 fn main() -> io::Result<()> {
-    let mut stream = TcpStream::connect("127.0.0.1:7878")?;
+    // Usage: client [address]   (default: the V8 leader on 127.0.0.1:7878)
+    let address = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "127.0.0.1:7878".to_string());
+    let mut stream = TcpStream::connect(&address)?;
     let stdin = io::stdin();
     let mut decoder = FrameDecoder::new();
     println!("connected to KV server");
