@@ -4,13 +4,16 @@ use std::path::{Path, PathBuf};
 
 use crate::raft::codec;
 use crate::raft::fsutil::{sync_parent_directory, temp_path_for, write_file_atomic};
-use crate::raft::types::LogEntry;
+use crate::raft::types::{ClusterConfig, Command, LogEntry};
 
 const HEADER_SIZE: u64 = 4;
 const MAX_RECORD_SIZE: usize = 1024 * 1024;
 
-const BASE_MAGIC: &[u8; 4] = b"RBAS";
-const BASE_FILE_SIZE: usize = 4 + 8 + 8;
+/// Current format: magic, base index, base term, then the cluster config
+/// as of the base. (`RBAS` is the old format without a config.)
+const BASE_MAGIC: &[u8; 4] = b"RBS2";
+const LEGACY_BASE_MAGIC: &[u8; 4] = b"RBAS";
+const LEGACY_BASE_FILE_SIZE: usize = 4 + 8 + 8;
 
 /// Durable Raft log with support for discarding a compacted prefix.
 ///
@@ -25,15 +28,24 @@ pub struct RaftLog {
     base_path: PathBuf,
     base_index: u64,
     base_term: u64,
+    /// The cluster config as of `base_index` (or the bootstrap config).
+    base_config: ClusterConfig,
     entries: Vec<LogEntry>,
     record_positions: Vec<u64>,
 }
 
 impl RaftLog {
     pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
+        Self::open_with_config(path, ClusterConfig::default())
+    }
+
+    /// `bootstrap` is the cluster config to assume when the log holds no
+    /// config entry and no compaction has happened yet.
+    pub fn open_with_config(path: impl AsRef<Path>, bootstrap: ClusterConfig) -> io::Result<Self> {
         let path = path.as_ref().to_path_buf();
         let base_path = path.with_extension("base");
-        let (base_index, base_term) = load_base(&base_path)?;
+        let (base_index, base_term, stored_config) = load_base(&base_path)?;
+        let base_config = stored_config.unwrap_or(bootstrap);
 
         let mut file = OpenOptions::new()
             .create(true)
@@ -111,6 +123,7 @@ impl RaftLog {
             base_path,
             base_index,
             base_term,
+            base_config,
             entries,
             record_positions,
         })
@@ -124,6 +137,35 @@ impl RaftLog {
     /// Term of the entry at `base_index` (0 if none).
     pub fn base_term(&self) -> u64 {
         self.base_term
+    }
+
+    /// The cluster config as of `base_index`.
+    pub fn base_config(&self) -> &ClusterConfig {
+        &self.base_config
+    }
+
+    /// The cluster config in effect at the end of the log, with the index of
+    /// the entry that set it (0 if it comes from the base / bootstrap).
+    pub fn latest_config(&self) -> (u64, ClusterConfig) {
+        self.config_as_of(self.last_index())
+    }
+
+    /// The config in effect once entries `..=index` have been applied: the
+    /// latest `Config` entry at or before `index`, else the base config.
+    pub fn config_as_of(&self, index: u64) -> (u64, ClusterConfig) {
+        let last = index.min(self.last_index());
+
+        let mut position = last.saturating_sub(self.base_index) as usize;
+
+        while position > 0 {
+            if let Command::Config(config) = &self.entries[position - 1].command {
+                return (self.base_index + position as u64, config.clone());
+            }
+
+            position -= 1;
+        }
+
+        (0, self.base_config.clone())
     }
 
     /// Index of the first entry still stored in the log.
@@ -240,11 +282,13 @@ impl RaftLog {
 
     /// Fold everything up to `index` (whose term is `term`) into a snapshot.
     ///
-    /// The caller must already have made the snapshot itself durable. If the
+    /// `config` is the cluster config as of `index` (it must travel with the
+    /// snapshot, since the config entries being dropped are the only record
+    /// of it). The caller must already have made the snapshot durable. If the
     /// log has a matching entry at `index` the later entries are kept;
     /// otherwise (the snapshot is ahead of, or disagrees with, this log) the
     /// whole log is discarded.
-    pub fn compact_to(&mut self, index: u64, term: u64) -> io::Result<()> {
+    pub fn compact_to(&mut self, index: u64, term: u64, config: ClusterConfig) -> io::Result<()> {
         if index <= self.base_index {
             return Ok(());
         }
@@ -266,7 +310,7 @@ impl RaftLog {
 
         // 1. Record the new base durably. From here on, older records in the
         //    file are ignored on open, so a crash below is harmless.
-        write_file_atomic(&self.base_path, &encode_base(index, term))?;
+        write_file_atomic(&self.base_path, &encode_base(index, term, &config)?)?;
 
         // 2. Rewrite the log file with only the kept entries.
         let temp_path = temp_path_for(&self.path);
@@ -306,6 +350,7 @@ impl RaftLog {
         self.file = file;
         self.base_index = index;
         self.base_term = term;
+        self.base_config = config;
         self.entries = kept;
         self.record_positions = positions;
 
@@ -395,28 +440,37 @@ impl RaftLog {
     }
 }
 
-fn encode_base(index: u64, term: u64) -> Vec<u8> {
-    let mut out = Vec::with_capacity(BASE_FILE_SIZE);
+fn encode_base(index: u64, term: u64, config: &ClusterConfig) -> io::Result<Vec<u8>> {
+    let mut out = Vec::new();
 
     out.extend_from_slice(BASE_MAGIC);
     codec::put_u64(&mut out, index);
     codec::put_u64(&mut out, term);
+    codec::put_config(&mut out, config)?;
 
-    out
+    Ok(out)
 }
 
-fn load_base(path: &Path) -> io::Result<(u64, u64)> {
+/// `(index, term, config)`. A missing file means "never compacted"; the
+/// config is `None` for the legacy format (the caller's bootstrap applies).
+fn load_base(path: &Path) -> io::Result<(u64, u64, Option<ClusterConfig>)> {
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok((0, 0)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok((0, 0, None)),
         Err(error) => return Err(error),
     };
 
-    if bytes.len() != BASE_FILE_SIZE || &bytes[..4] != BASE_MAGIC {
+    if bytes.len() < 4 {
         return Err(invalid_data("invalid Raft log base file"));
     }
 
     let mut cursor = 4;
+    let config_follows = match &bytes[..4] {
+        magic if magic == BASE_MAGIC => true,
+        magic if magic == LEGACY_BASE_MAGIC && bytes.len() == LEGACY_BASE_FILE_SIZE => false,
+        _ => return Err(invalid_data("invalid Raft log base file")),
+    };
+
     let index = codec::read_u64(&bytes, &mut cursor)?;
     let term = codec::read_u64(&bytes, &mut cursor)?;
 
@@ -424,7 +478,19 @@ fn load_base(path: &Path) -> io::Result<(u64, u64)> {
         return Err(invalid_data("invalid Raft log base position"));
     }
 
-    Ok((index, term))
+    let config = if config_follows {
+        let config = codec::read_config(&bytes, &mut cursor)?;
+
+        if cursor != bytes.len() {
+            return Err(invalid_data("trailing bytes in Raft log base file"));
+        }
+
+        Some(config)
+    } else {
+        None
+    };
+
+    Ok((index, term, config))
 }
 
 fn encode_entry(index: u64, entry: &LogEntry) -> io::Result<Vec<u8>> {

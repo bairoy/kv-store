@@ -8,6 +8,7 @@ pub mod server;
 #[cfg(test)]
 mod sim;
 pub mod snapshot;
+pub mod txn;
 #[cfg(test)]
 mod tests;
 pub mod types;

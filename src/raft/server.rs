@@ -3,11 +3,17 @@
 //! `RaftNode` holds the pure protocol state; this module drives it with
 //! timers and TCP, and applies committed entries to the `LsmStore`.
 //!
-//! Known simplifications: one TCP connection per RPC, and reads are served by
-//! the leader from its local store without a quorum check.
+//! Known simplification: one TCP connection per RPC. Reads are linearizable
+//! (see `read_barrier`).
+//!
+//! One `RaftServer` is one Raft *group*. A stand-alone node (V9) runs a single
+//! group; a sharded node (V10, `shard::node`) runs one per partition and
+//! shares one TCP port between them, which is why every peer message is
+//! wrapped in a group-id envelope.
 
 use std::collections::HashMap;
 use std::io;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -20,9 +26,13 @@ use crate::net::framing::{FrameDecoder, encode_frame};
 use crate::net::protocol::{Command as ClientCommand, Response, encode_response, parse_request};
 use crate::raft::codec::invalid_data;
 use crate::raft::node::RaftNode;
-use crate::raft::rpc::{RaftMessage, decode_message, encode_message};
+use crate::raft::rpc::{RaftMessage, decode_envelope, encode_envelope};
 use crate::raft::snapshot::RaftSnapshot;
-use crate::raft::types::{Command, InstallSnapshotArgs, InstallSnapshotReply, NodeId, Role};
+use crate::raft::txn::{self, PendingTxn, TxnEffect};
+use crate::raft::types::{
+    ClusterConfig, Command, ConfigChange, InstallSnapshotArgs, InstallSnapshotReply, NodeId, Role,
+    TxnCommand,
+};
 use crate::storage::lsm::LsmStore;
 
 const MAX_ENTRIES_PER_MESSAGE: usize = 64;
@@ -33,7 +43,9 @@ const MAX_INCOMING_SNAPSHOT_BYTES: usize = 256 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct RaftConfig {
-    /// Peer RPC address of every *other* node.
+    /// Peer RPC address of every server that could ever be in this group
+    /// (an address book). Who is actually *in* the group right now is decided
+    /// by the node's membership config, which changes at runtime.
     pub peers: HashMap<NodeId, String>,
     pub election_timeout_min: Duration,
     pub election_timeout_max: Duration,
@@ -49,6 +61,10 @@ pub struct RaftConfig {
     /// Confirm leadership with a majority before serving a read. Turning
     /// this off is faster but a deposed leader may return stale data.
     pub linearizable_reads: bool,
+    /// Which Raft group this is when several share one TCP port (0 if alone).
+    pub group_id: u32,
+    /// Shown in log lines when several groups run in one process (e.g. `p3`).
+    pub group_name: Option<String>,
 }
 
 impl RaftConfig {
@@ -63,8 +79,20 @@ impl RaftConfig {
             snapshot_threshold: 1000,
             snapshot_chunk_size: 256 * 1024,
             linearizable_reads: true,
+            group_id: 0,
+            group_name: None,
         }
     }
+}
+
+/// What a server knows about one Raft group right now.
+#[derive(Debug, Clone)]
+pub struct GroupInfo {
+    pub role: Role,
+    pub leader: Option<NodeId>,
+    pub term: u64,
+    pub commit_index: u64,
+    pub config: ClusterConfig,
 }
 
 /// A snapshot being received chunk by chunk from the leader.
@@ -76,6 +104,8 @@ struct IncomingSnapshot {
 
 pub struct RaftServer {
     id: NodeId,
+    /// Prefix for log lines, e.g. `Raft 2` or `Raft 2/p3`.
+    label: String,
     node: Mutex<RaftNode>,
     store: Mutex<LsmStore>,
     /// Serialises applying committed entries to the store.
@@ -83,18 +113,47 @@ pub struct RaftServer {
     incoming_snapshot: Mutex<Option<IncomingSnapshot>>,
     config: RaftConfig,
     election_deadline: StdMutex<Instant>,
+    /// When we last heard from a legitimate leader (for ignoring disruptive
+    /// vote requests from servers that were removed from the group).
+    last_leader_contact: StdMutex<Instant>,
+    /// Set when this server stops hosting the group.
+    stopped: AtomicBool,
+    /// Transactions prepared here and not finished yet, with when we first
+    /// saw them (kept in step with the store; used to recover stuck ones).
+    pending_txns: StdMutex<HashMap<String, (PendingTxn, Instant)>>,
 }
 
 impl RaftServer {
     pub fn new(node: RaftNode, store: LsmStore, config: RaftConfig) -> Arc<Self> {
+        let label = match &config.group_name {
+            Some(name) => format!("Raft {}/{name}", node.id),
+            None => format!("Raft {}", node.id),
+        };
+
+        // Transactions that were prepared before a restart still hold locks.
+        let pending_txns = match txn::scan_pending(&store) {
+            Ok(found) => found
+                .into_iter()
+                .map(|pending| (pending.id.clone(), (pending, Instant::now())))
+                .collect(),
+            Err(error) => {
+                eprintln!("{label}: could not scan for prepared transactions: {error}");
+                HashMap::new()
+            }
+        };
+
         let server = Arc::new(Self {
             id: node.id,
+            label,
             node: Mutex::new(node),
             store: Mutex::new(store),
             apply_lock: Mutex::new(()),
             incoming_snapshot: Mutex::new(None),
             config,
             election_deadline: StdMutex::new(Instant::now()),
+            last_leader_contact: StdMutex::new(Instant::now() - Duration::from_secs(3600)),
+            stopped: AtomicBool::new(false),
+            pending_txns: StdMutex::new(pending_txns),
         });
 
         server.reset_election_timer();
@@ -112,6 +171,48 @@ impl RaftServer {
         Ok(())
     }
 
+    /// Stop hosting this group: the ticker exits and requests are refused.
+    pub fn stop(&self) {
+        self.stopped.store(true, Ordering::SeqCst);
+    }
+
+    pub fn is_stopped(&self) -> bool {
+        self.stopped.load(Ordering::SeqCst)
+    }
+
+    fn note_leader_contact(&self) {
+        if let Ok(mut guard) = self.last_leader_contact.lock() {
+            *guard = Instant::now();
+        }
+    }
+
+    /// A vote request is ignored while we are the leader, or have heard from
+    /// one recently: a server that was removed from the group (and does not
+    /// know it) keeps timing out and must not be able to depose a healthy
+    /// leader by sending ever-higher terms (Raft thesis, section 4.2.3).
+    async fn ignores_vote_requests(&self) -> bool {
+        let (role, leader) = self.leader_status().await;
+
+        if role == Role::Leader {
+            return true;
+        }
+
+        let recent = self
+            .last_leader_contact
+            .lock()
+            .map(|contact| contact.elapsed() < self.config.election_timeout_min / 2)
+            .unwrap_or(false);
+
+        leader.is_some() && recent
+    }
+
+    /// Current role and best-known leader (for routing and status output).
+    pub async fn leader_status(&self) -> (Role, Option<NodeId>) {
+        let node = self.node.lock().await;
+
+        (node.role, node.leader_id)
+    }
+
     // ---------------------------------------------------------------- timers
 
     fn random_election_timeout(&self) -> Duration {
@@ -125,7 +226,8 @@ impl RaftServer {
             .unwrap_or(0);
 
         // xorshift mixes the clock with the node id so peers rarely tie.
-        let mut x = now ^ self.id.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        let group = u64::from(self.config.group_id).wrapping_mul(0xD6E8_FEB8_6659_FD93);
+        let mut x = now ^ self.id.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ group | 1;
         x ^= x << 13;
         x ^= x >> 7;
         x ^= x << 17;
@@ -148,12 +250,16 @@ impl RaftServer {
             .unwrap_or(false)
     }
 
-    async fn run_ticker(self: Arc<Self>) -> io::Result<()> {
+    pub async fn run_ticker(self: Arc<Self>) -> io::Result<()> {
         let mut last_heartbeat = Instant::now();
         let mut was_leader = false;
 
         loop {
             sleep(TICK_INTERVAL).await;
+
+            if self.is_stopped() {
+                return Ok(());
+            }
 
             let is_leader = self.node.lock().await.role == Role::Leader;
 
@@ -161,6 +267,12 @@ impl RaftServer {
                 if last_heartbeat.elapsed() >= self.config.heartbeat_interval {
                     last_heartbeat = Instant::now();
                     self.broadcast_append().await;
+
+                    // A leader without followers (a single-voter group) gets
+                    // no replies that would trigger applying, so do it here.
+                    if let Err(error) = self.apply_committed().await {
+                        eprintln!("{}: apply failed: {error}", self.label);
+                    }
                 }
             } else {
                 if was_leader {
@@ -169,7 +281,13 @@ impl RaftServer {
                 }
 
                 if self.election_timer_expired() {
-                    self.start_election().await;
+                    // Learners, joining servers and removed servers never
+                    // campaign; just wait for a leader to contact them.
+                    if self.node.lock().await.can_campaign() {
+                        self.start_election().await;
+                    } else {
+                        self.reset_election_timer();
+                    }
                 }
             }
 
@@ -182,27 +300,25 @@ impl RaftServer {
     async fn start_election(self: &Arc<Self>) {
         self.reset_election_timer();
 
-        let (args, became_leader) = {
+        let (args, became_leader, peers) = {
             let mut node = self.node.lock().await;
 
             match node.start_election() {
-                Ok(args) => (args, node.role == Role::Leader),
+                Ok(args) => (args, node.role == Role::Leader, node.voter_peers()),
                 Err(error) => {
-                    eprintln!("Raft {}: cannot start election: {error}", self.id);
+                    eprintln!("{}: cannot start election: {error}", self.label);
                     return;
                 }
             }
         };
 
-        println!("Raft {}: starting election for term {}", self.id, args.term);
+        println!("{}: starting election for term {}", self.label, args.term);
 
         if became_leader {
-            println!("Raft {}: became leader for term {}", self.id, args.term);
+            println!("{}: became leader for term {}", self.label, args.term);
             self.broadcast_append().await;
             return;
         }
-
-        let peers: Vec<NodeId> = self.config.peers.keys().copied().collect();
 
         for peer in peers {
             let server = Arc::clone(self);
@@ -230,14 +346,14 @@ impl RaftServer {
             match node.record_vote_response(peer, reply) {
                 Ok(became_leader) => became_leader,
                 Err(error) => {
-                    eprintln!("Raft {}: vote handling failed: {error}", self.id);
+                    eprintln!("{}: vote handling failed: {error}", self.label);
                     return;
                 }
             }
         };
 
         if became_leader {
-            println!("Raft {}: became leader for term {term}", self.id);
+            println!("{}: became leader for term {term}", self.label);
             self.broadcast_append().await;
         }
     }
@@ -245,7 +361,7 @@ impl RaftServer {
     // ----------------------------------------------------------- replication
 
     async fn broadcast_append(self: &Arc<Self>) {
-        let peers: Vec<NodeId> = self.config.peers.keys().copied().collect();
+        let peers = self.node.lock().await.peers();
 
         for peer in peers {
             let server = Arc::clone(self);
@@ -295,13 +411,13 @@ impl RaftServer {
                 let mut node = self.node.lock().await;
 
                 if let Err(error) = node.handle_append_entries_reply(peer, &args, reply) {
-                    eprintln!("Raft {}: reply handling failed: {error}", self.id);
+                    eprintln!("{}: reply handling failed: {error}", self.label);
                     return;
                 }
             }
 
             if let Err(error) = self.apply_committed().await {
-                eprintln!("Raft {}: apply failed: {error}", self.id);
+                eprintln!("{}: apply failed: {error}", self.label);
                 return;
             }
 
@@ -330,7 +446,13 @@ impl RaftServer {
                     Command::Delete { key } => {
                         store.delete(key)?;
                     }
-                    Command::Noop => {}
+                    // Membership is handled inside RaftNode; nothing to do
+                    // to the key-value data.
+                    Command::Noop | Command::Config(_) => {}
+                    Command::Txn(step) => {
+                        let effect = crate::raft::txn::apply(&mut store, &step)?;
+                        self.note_txn_effect(effect);
+                    }
                 }
             }
         }
@@ -355,9 +477,12 @@ impl RaftServer {
 
         let entries = self.store.lock().await.snapshot_entries()?;
 
+        let config = self.node.lock().await.config_as_of(index);
+
         let snapshot = RaftSnapshot {
             last_included_index: index,
             last_included_term: term,
+            config,
             entries,
         };
 
@@ -368,8 +493,8 @@ impl RaftServer {
         node.compact_log_to(index, term)?;
 
         println!(
-            "Raft {}: snapshot at index {index}; log now starts at {}",
-            self.id,
+            "{}: snapshot at index {index}; log now starts at {}",
+            self.label,
             node.log.first_index()
         );
 
@@ -384,7 +509,7 @@ impl RaftServer {
         match self.try_send_snapshot(peer).await {
             Ok(sent) => sent,
             Err(error) => {
-                eprintln!("Raft {}: snapshot to node {peer} failed: {error}", self.id);
+                eprintln!("{}: snapshot to node {peer} failed: {error}", self.label);
                 false
             }
         }
@@ -434,8 +559,8 @@ impl RaftServer {
             // down follower doesn't spam the log on every heartbeat.
             if offset == 0 {
                 println!(
-                    "Raft {}: sending snapshot (index {}, {} bytes) to node {peer}",
-                    self.id,
+                    "{}: sending snapshot (index {}, {} bytes) to node {peer}",
+                    self.label,
                     snapshot.last_included_index,
                     bytes.len()
                 );
@@ -470,6 +595,7 @@ impl RaftServer {
         };
 
         self.reset_election_timer();
+        self.note_leader_contact();
 
         let finished = {
             let mut incoming = self.incoming_snapshot.lock().await;
@@ -538,14 +664,17 @@ impl RaftServer {
             .await
             .install_snapshot(&snapshot.entries, snapshot.last_included_index)?;
 
-        self.node
-            .lock()
-            .await
-            .finish_snapshot_install(snapshot.last_included_index, snapshot.last_included_term)?;
+        self.node.lock().await.finish_snapshot_install(
+            snapshot.last_included_index,
+            snapshot.last_included_term,
+            snapshot.config.clone(),
+        )?;
+
+        self.rebuild_pending_transactions().await;
 
         println!(
-            "Raft {}: installed snapshot through index {}",
-            self.id, snapshot.last_included_index
+            "{}: installed snapshot through index {}",
+            self.label, snapshot.last_included_index
         );
 
         Ok(())
@@ -560,7 +689,7 @@ impl RaftServer {
             .get(&peer)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "unknown peer"))?;
 
-        let payload = encode_message(message)?;
+        let payload = encode_envelope(self.config.group_id, message)?;
         let frame = encode_frame(&payload)?;
 
         let exchange = async {
@@ -578,7 +707,13 @@ impl RaftServer {
             .await
             .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "Raft RPC timed out"))??;
 
-        decode_message(&reply)
+        let (group_id, message) = decode_envelope(&reply)?;
+
+        if group_id != self.config.group_id {
+            return Err(invalid_data("reply is from a different Raft group"));
+        }
+
+        Ok(message)
     }
 
     pub async fn run_peer_server(self: Arc<Self>, address: &str) -> io::Result<()> {
@@ -592,7 +727,7 @@ impl RaftServer {
                 if let Err(error) = server.handle_peer(stream).await
                     && error.kind() != io::ErrorKind::UnexpectedEof
                 {
-                    eprintln!("Raft {}: peer connection error: {error}", server.id);
+                    eprintln!("{}: peer connection error: {error}", server.label);
                 }
             });
         }
@@ -602,8 +737,14 @@ impl RaftServer {
         let mut decoder = FrameDecoder::new();
 
         while let Some(payload) = read_frame(&mut stream, &mut decoder).await? {
-            let reply = self.handle_peer_message(decode_message(&payload)?).await?;
-            let frame = encode_frame(&encode_message(&reply)?)?;
+            let (group_id, message) = decode_envelope(&payload)?;
+
+            if group_id != self.config.group_id {
+                return Err(invalid_data("message is for a different Raft group"));
+            }
+
+            let reply = self.handle_peer_message(message).await?;
+            let frame = encode_frame(&encode_envelope(group_id, &reply)?)?;
 
             stream.write_all(&frame).await?;
         }
@@ -611,9 +752,24 @@ impl RaftServer {
         Ok(())
     }
 
-    async fn handle_peer_message(&self, message: RaftMessage) -> io::Result<RaftMessage> {
+    pub async fn handle_peer_message(&self, message: RaftMessage) -> io::Result<RaftMessage> {
+        if self.is_stopped() {
+            return Err(invalid_data("this server no longer hosts the Raft group"));
+        }
+
         match message {
             RaftMessage::RequestVote(args) => {
+                if self.ignores_vote_requests().await {
+                    let term = self.node.lock().await.current_term;
+
+                    return Ok(RaftMessage::RequestVoteReply(
+                        crate::raft::types::RequestVoteReply {
+                            term,
+                            vote_granted: false,
+                        },
+                    ));
+                }
+
                 let reply = self.node.lock().await.handle_vote_request(args)?;
 
                 if reply.vote_granted {
@@ -630,6 +786,7 @@ impl RaftServer {
                 // Only a request from a current-or-newer leader resets the timer.
                 if reply.term == term {
                     self.reset_election_timer();
+                    self.note_leader_contact();
                 }
 
                 self.apply_committed().await?;
@@ -656,7 +813,7 @@ impl RaftServer {
 
             tokio::spawn(async move {
                 if let Err(error) = server.handle_client(stream).await {
-                    eprintln!("Raft {}: client connection error: {error}", server.id);
+                    eprintln!("{}: client connection error: {error}", server.label);
                 }
             });
         }
@@ -682,7 +839,17 @@ impl RaftServer {
         Ok(())
     }
 
-    async fn execute_command(self: &Arc<Self>, command: ClientCommand) -> Response {
+    pub async fn execute_command(self: &Arc<Self>, command: ClientCommand) -> Response {
+        let key = match &command {
+            ClientCommand::Get(key) | ClientCommand::Set(key, _) | ClientCommand::Delete(key) => {
+                key
+            }
+        };
+
+        if txn::is_reserved(key) {
+            return Response::Error("that key is reserved for transactions".to_string());
+        }
+
         match command {
             ClientCommand::Get(key) => {
                 if let Err(response) = self.read_barrier().await {
@@ -722,7 +889,7 @@ impl RaftServer {
     ///    newer leader can exist;
     /// 3. the store must have applied everything committed when we started.
     async fn read_barrier(self: &Arc<Self>) -> Result<(), Response> {
-        let (term, read_index, quorum, peers) = {
+        let (term, read_index, quorum, peers, self_votes) = {
             let node = self.node.lock().await;
 
             if node.role != Role::Leader {
@@ -743,11 +910,13 @@ impl RaftServer {
                 node.current_term,
                 node.commit_index,
                 node.quorum_size(),
-                node.peers(),
+                node.voter_peers(),
+                usize::from(node.is_voter()),
             )
         };
 
-        let mut acknowledgements = 1; // ourselves
+        // Only voters count (never learners); we count ourselves if we are one.
+        let mut acknowledgements = self_votes;
 
         if acknowledgements < quorum {
             let tasks: Vec<_> = peers
@@ -828,29 +997,136 @@ impl RaftServer {
         let mut node = self.node.lock().await;
 
         if let Err(error) = node.handle_append_entries_reply(peer, &args, reply) {
-            eprintln!("Raft {}: reply handling failed: {error}", self.id);
+            eprintln!("{}: reply handling failed: {error}", self.label);
         }
 
         acknowledged
     }
 
-    /// Append to the log, replicate, and wait until the entry is committed
-    /// and applied locally.
-    async fn replicate_write(self: &Arc<Self>, command: Command) -> Response {
+    // ----------------------------------------------------------- membership
+
+    /// Leader: propose one membership change and wait until it is committed.
+    pub async fn change_membership(self: &Arc<Self>, change: ConfigChange) -> Result<(), String> {
         let (index, term) = {
             let mut node = self.node.lock().await;
 
             if node.role != Role::Leader {
-                return not_leader_response(&node);
+                return Err(match node.leader_id {
+                    Some(leader) => format!("not leader; leader is node {leader}"),
+                    None => "not leader; no leader elected yet".to_string(),
+                });
+            }
+
+            let index = node
+                .propose_config_change(change)
+                .map_err(|error| error.to_string())?;
+
+            (index, node.current_term)
+        };
+
+        self.broadcast_append().await;
+
+        if let Err(error) = self.apply_committed().await {
+            return Err(error.to_string());
+        }
+
+        let deadline = Instant::now() + self.config.commit_timeout;
+
+        loop {
+            {
+                let node = self.node.lock().await;
+
+                // A leader that removed itself steps down once the change is
+                // committed, so check the log, not the role.
+                if node.commit_index >= index {
+                    return if node.log.term_at(index) == Some(term) {
+                        Ok(())
+                    } else {
+                        Err("the change was overwritten by a new leader".to_string())
+                    };
+                }
+
+                if node.current_term != term {
+                    return Err("leadership changed before the change committed".to_string());
+                }
+            }
+
+            if Instant::now() >= deadline {
+                return Err("timed out waiting for the change to commit".to_string());
+            }
+
+            sleep(APPLY_POLL_INTERVAL).await;
+        }
+    }
+
+    /// Leader: how many committed entries `peer` still lacks.
+    pub async fn replication_lag(&self, peer: NodeId) -> Option<u64> {
+        let node = self.node.lock().await;
+
+        if node.role != Role::Leader {
+            return None;
+        }
+
+        node.match_index_of(peer)
+            .map(|matched| node.commit_index.saturating_sub(matched))
+    }
+
+    /// A snapshot of this group's state for status output and for the
+    /// rebalancer (which has to find the leader and see the membership).
+    pub async fn info(&self) -> GroupInfo {
+        let node = self.node.lock().await;
+
+        GroupInfo {
+            role: node.role,
+            leader: node.leader_id,
+            term: node.current_term,
+            commit_index: node.commit_index,
+            config: node.config().clone(),
+        }
+    }
+
+    /// Read straight from this server's own store, with no leadership check.
+    /// For diagnostics and tests only: it can be stale on a follower.
+    pub async fn local_get(&self, key: &str) -> Option<String> {
+        self.store.lock().await.get(key)
+    }
+
+    /// The membership this server currently believes in.
+    pub async fn membership(&self) -> ClusterConfig {
+        self.node.lock().await.config().clone()
+    }
+
+    /// Append to the log, replicate, and wait until the entry is committed
+    /// and applied locally.
+    async fn replicate_write(self: &Arc<Self>, command: Command) -> Response {
+        match self.append_and_wait(command).await {
+            Ok(()) => Response::Ok,
+            Err(message) => Response::Error(message),
+        }
+    }
+
+    /// Append `command` as leader, replicate it, and wait until it has been
+    /// committed *and applied* here.
+    async fn append_and_wait(self: &Arc<Self>, command: Command) -> Result<(), String> {
+        let (index, term) = {
+            let mut node = self.node.lock().await;
+
+            if node.role != Role::Leader {
+                return Err(not_leader_message(&node));
             }
 
             match node.append_client_command(command) {
                 Ok(index) => (index, node.current_term),
-                Err(error) => return Response::Error(error.to_string()),
+                Err(error) => return Err(error.to_string()),
             }
         };
 
         self.broadcast_append().await;
+
+        // The entry may already be committed (single-voter group).
+        if let Err(error) = self.apply_committed().await {
+            return Err(error.to_string());
+        }
 
         let deadline = Instant::now() + self.config.commit_timeout;
 
@@ -859,28 +1135,107 @@ impl RaftServer {
                 let node = self.node.lock().await;
 
                 if node.role != Role::Leader || node.current_term != term {
-                    return Response::Error(
+                    return Err(
                         "leadership changed before the write committed; outcome unknown"
                             .to_string(),
                     );
                 }
 
                 if node.last_applied >= index {
-                    return Response::Ok;
+                    return Ok(());
                 }
             }
 
             if Instant::now() >= deadline {
-                return Response::Error("timed out waiting for a majority".to_string());
+                return Err("timed out waiting for a majority".to_string());
             }
 
             sleep(APPLY_POLL_INTERVAL).await;
         }
     }
+
+    // ------------------------------------------------------- transactions
+
+    /// Leader: replicate one transaction step and return what applying it
+    /// produced (the vote, the winning decision, or `OK`).
+    pub async fn txn_command(self: &Arc<Self>, step: TxnCommand) -> Result<String, String> {
+        self.append_and_wait(Command::Txn(step.clone())).await?;
+
+        Ok(txn::outcome(&*self.store.lock().await, &step))
+    }
+
+    /// Leader: the recorded decision for `id` (this must be the coordinator
+    /// partition), read linearizably. `None` means no decision yet.
+    pub async fn txn_decision(self: &Arc<Self>, id: &str) -> Result<Option<String>, String> {
+        self.read_barrier()
+            .await
+            .map_err(|response| match response {
+                Response::Error(message) => message,
+                _ => "could not confirm leadership".to_string(),
+            })?;
+
+        Ok(txn::decision(&*self.store.lock().await, id))
+    }
+
+    /// Transactions prepared here and not finished, with how long ago we
+    /// first saw each.
+    pub fn pending_transactions(&self) -> Vec<(PendingTxn, Duration)> {
+        self.pending_txns
+            .lock()
+            .map(|pending| {
+                pending
+                    .values()
+                    .map(|(txn, since)| (txn.clone(), since.elapsed()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn note_txn_effect(&self, effect: TxnEffect) {
+        let Ok(mut pending) = self.pending_txns.lock() else {
+            return;
+        };
+
+        match effect {
+            TxnEffect::Nothing => {}
+            TxnEffect::Prepared(txn) => {
+                pending
+                    .entry(txn.id.clone())
+                    .or_insert_with(|| (txn, Instant::now()));
+            }
+            TxnEffect::Finished(id) => {
+                pending.remove(&id);
+            }
+        }
+    }
+
+    /// After a snapshot replaced the store, re-read which transactions are
+    /// in flight (applying never ran for the entries the snapshot covered).
+    async fn rebuild_pending_transactions(&self) {
+        let found = match txn::scan_pending(&*self.store.lock().await) {
+            Ok(found) => found,
+            Err(error) => {
+                eprintln!("{}: could not rescan transactions: {error}", self.label);
+                return;
+            }
+        };
+
+        if let Ok(mut pending) = self.pending_txns.lock() {
+            let now = Instant::now();
+            let mut rebuilt = HashMap::new();
+
+            for txn in found {
+                let since = pending.get(&txn.id).map_or(now, |(_, since)| *since);
+                rebuilt.insert(txn.id.clone(), (txn, since));
+            }
+
+            *pending = rebuilt;
+        }
+    }
 }
 
 /// Read one complete frame, or `None` if the peer closed the connection.
-async fn read_frame(
+pub(crate) async fn read_frame(
     stream: &mut TcpStream,
     decoder: &mut FrameDecoder,
 ) -> io::Result<Option<Vec<u8>>> {
@@ -901,9 +1256,13 @@ async fn read_frame(
     }
 }
 
-fn not_leader_response(node: &RaftNode) -> Response {
-    Response::Error(match node.leader_id {
+fn not_leader_message(node: &RaftNode) -> String {
+    match node.leader_id {
         Some(leader) => format!("not leader; leader is node {leader}"),
         None => "not leader; no leader elected yet".to_string(),
-    })
+    }
+}
+
+fn not_leader_response(node: &RaftNode) -> Response {
+    Response::Error(not_leader_message(node))
 }

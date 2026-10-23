@@ -152,6 +152,24 @@ pub fn decode_message(bytes: &[u8]) -> io::Result<RaftMessage> {
     Ok(message)
 }
 
+/// Prefix a message with the id of the Raft group it belongs to, so several
+/// groups (one per partition) can share a single TCP port: `[group u32][message]`.
+pub fn encode_envelope(group_id: u32, message: &RaftMessage) -> io::Result<Vec<u8>> {
+    let mut out = Vec::new();
+
+    put_u32(&mut out, group_id);
+    out.extend_from_slice(&encode_message(message)?);
+
+    Ok(out)
+}
+
+pub fn decode_envelope(bytes: &[u8]) -> io::Result<(u32, RaftMessage)> {
+    let mut cursor = 0;
+    let group_id = read_u32(bytes, &mut cursor)?;
+
+    Ok((group_id, decode_message(&bytes[cursor..])?))
+}
+
 fn read_bool(bytes: &[u8], cursor: &mut usize) -> io::Result<bool> {
     match read_u8(bytes, cursor)? {
         0 => Ok(false),
@@ -203,6 +221,42 @@ mod tests {
                     term: 4,
                     command: Command::Noop,
                 },
+                LogEntry {
+                    term: 4,
+                    command: Command::Config(crate::raft::types::ClusterConfig {
+                        voters: vec![1, 2, 3],
+                        learners: vec![4],
+                    }),
+                },
+                LogEntry {
+                    term: 4,
+                    command: Command::Txn(crate::raft::types::TxnCommand::Prepare {
+                        id: "t1-7".into(),
+                        coordinator: 2,
+                        participants: vec![2, 5],
+                        ops: vec![
+                            crate::raft::types::TxnOp::Set {
+                                key: "a".into(),
+                                value: "1".into(),
+                            },
+                            crate::raft::types::TxnOp::Delete { key: "b".into() },
+                        ],
+                    }),
+                },
+                LogEntry {
+                    term: 4,
+                    command: Command::Txn(crate::raft::types::TxnCommand::Decide {
+                        id: "t1-7".into(),
+                        commit: true,
+                    }),
+                },
+                LogEntry {
+                    term: 4,
+                    command: Command::Txn(crate::raft::types::TxnCommand::Finish {
+                        id: "t1-7".into(),
+                        commit: false,
+                    }),
+                },
             ],
             leader_commit: 6,
         }));
@@ -222,6 +276,26 @@ mod tests {
         round_trip(RaftMessage::InstallSnapshotReply(InstallSnapshotReply {
             term: 5,
         }));
+    }
+
+    #[test]
+    fn envelope_carries_the_group_id() {
+        let message = RaftMessage::RequestVoteReply(RequestVoteReply {
+            term: 9,
+            vote_granted: true,
+        });
+
+        let bytes = encode_envelope(137, &message).expect("encode");
+        assert_eq!(decode_envelope(&bytes).expect("decode"), (137, message));
+
+        assert!(
+            decode_envelope(&[0, 0]).is_err(),
+            "too short for a group id"
+        );
+        assert!(
+            decode_envelope(&[0, 0, 0, 1]).is_err(),
+            "no message after the id"
+        );
     }
 
     #[test]

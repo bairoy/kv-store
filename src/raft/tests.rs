@@ -7,7 +7,8 @@ use crate::raft::{
     node::RaftNode,
     snapshot::RaftSnapshot,
     types::{
-        AppendEntriesArgs, Command, LogEntry, NodeId, RequestVoteArgs, RequestVoteReply, Role,
+        AppendEntriesArgs, ClusterConfig, Command, ConfigChange, LogEntry, NodeId, RequestVoteArgs,
+        RequestVoteReply, Role,
     },
 };
 
@@ -677,7 +678,8 @@ fn log_with_terms(name: &str, terms: &[u64]) -> (RaftLog, PathBuf) {
 fn compaction_keeps_the_suffix_and_survives_restart() {
     let (mut log, path) = log_with_terms("compact_suffix", &[1, 1, 2, 2, 2]);
 
-    log.compact_to(3, 2).expect("compact");
+    log.compact_to(3, 2, ClusterConfig::default())
+        .expect("compact");
 
     assert_eq!(log.base_index(), 3);
     assert_eq!(log.first_index(), 4);
@@ -706,7 +708,8 @@ fn compaction_keeps_the_suffix_and_survives_restart() {
 fn compacting_past_the_end_or_over_a_conflict_discards_the_whole_log() {
     // Snapshot ahead of the log.
     let (mut log, path) = log_with_terms("compact_ahead", &[1, 1, 1]);
-    log.compact_to(10, 4).expect("compact");
+    log.compact_to(10, 4, ClusterConfig::default())
+        .expect("compact");
 
     assert_eq!(log.last_index(), 10);
     assert_eq!(log.last_term(), 4);
@@ -719,7 +722,8 @@ fn compacting_past_the_end_or_over_a_conflict_discards_the_whole_log() {
 
     // Snapshot disagrees with the entry at its index.
     let (mut log, _) = log_with_terms("compact_conflict", &[1, 1, 1, 1]);
-    log.compact_to(2, 5).expect("compact");
+    log.compact_to(2, 5, ClusterConfig::default())
+        .expect("compact");
 
     assert_eq!(log.last_index(), 2, "conflicting suffix must not survive");
     assert_eq!(log.last_term(), 5);
@@ -730,7 +734,8 @@ fn crash_between_writing_the_base_and_rewriting_the_log_is_recovered() {
     let (mut log, path) = log_with_terms("compact_crash", &[1, 1, 2, 2]);
 
     let before = std::fs::read(&path).expect("read log before compaction");
-    log.compact_to(2, 1).expect("compact");
+    log.compact_to(2, 1, ClusterConfig::default())
+        .expect("compact");
     drop(log);
 
     // Simulate the crash: the new base is durable, the old log file is back.
@@ -747,7 +752,8 @@ fn crash_between_writing_the_base_and_rewriting_the_log_is_recovered() {
 #[test]
 fn leader_batches_overlapping_the_snapshot_are_trimmed() {
     let (mut log, _) = log_with_terms("trim_overlap", &[1, 1, 1, 1, 1]);
-    log.compact_to(3, 1).expect("compact");
+    log.compact_to(3, 1, ClusterConfig::default())
+        .expect("compact");
 
     let batch = vec![
         entry(1, "k2", "v"),
@@ -790,6 +796,7 @@ fn compacted_node_resumes_from_its_snapshot_and_needs_the_snapshot_file() {
         RaftSnapshot {
             last_included_index: 3,
             last_included_term: 1,
+            config: ClusterConfig::new(members()),
             entries: Default::default(),
         }
         .write_atomic(&snapshot_path)
@@ -847,7 +854,7 @@ fn lagging_follower_is_caught_up_with_a_snapshot() {
     assert!(!nodes[2].observe_leader(0, 1).expect("stale term"));
     assert!(nodes[2].should_install_snapshot(6));
     nodes[2]
-        .finish_snapshot_install(6, 1)
+        .finish_snapshot_install(6, 1, ClusterConfig::new(members()))
         .expect("install snapshot");
 
     assert_eq!(nodes[2].commit_index, 6);
@@ -871,4 +878,376 @@ fn lagging_follower_is_caught_up_with_a_snapshot() {
         nodes[2].log.entry_at(7).map(|e| &e.command),
         Some(&set("after", "snapshot"))
     );
+}
+
+// ---------------------------------------------------------------------------
+// Membership changes
+// ---------------------------------------------------------------------------
+
+/// Three voters (ids 1-3) plus a joining server (id 4) that knows nothing.
+fn cluster_with_joiner(name: &str) -> Vec<RaftNode> {
+    let mut nodes = cluster(name);
+
+    nodes.push(
+        RaftNode::open_joining(4, test_log_path(&format!("{name}_4"))).expect("open joining node"),
+    );
+
+    nodes
+}
+
+fn voters_of(node: &RaftNode) -> Vec<NodeId> {
+    node.config().voters.clone()
+}
+
+#[test]
+fn config_changes_apply_one_server_at_a_time() {
+    let base = ClusterConfig::new(vec![1, 2, 3]);
+
+    let with_learner = ConfigChange::AddLearner(4).apply(&base).unwrap();
+    assert_eq!(with_learner.voters, vec![1, 2, 3]);
+    assert_eq!(with_learner.learners, vec![4]);
+    assert_eq!(
+        with_learner.quorum(),
+        2,
+        "a learner never changes the quorum"
+    );
+
+    let promoted = ConfigChange::Promote(4).apply(&with_learner).unwrap();
+    assert_eq!(promoted.voters, vec![1, 2, 3, 4]);
+    assert!(promoted.learners.is_empty());
+    assert_eq!(promoted.quorum(), 3);
+
+    let removed = ConfigChange::Remove(1).apply(&promoted).unwrap();
+    assert_eq!(removed.voters, vec![2, 3, 4]);
+
+    assert!(
+        ConfigChange::AddLearner(2).apply(&base).is_err(),
+        "already a member"
+    );
+    assert!(
+        ConfigChange::Promote(4).apply(&base).is_err(),
+        "not a learner"
+    );
+    assert!(
+        ConfigChange::Remove(9).apply(&base).is_err(),
+        "not a member"
+    );
+    assert!(
+        ConfigChange::Remove(1)
+            .apply(&ClusterConfig::new(vec![1]))
+            .is_err(),
+        "cannot remove the last voter"
+    );
+}
+
+#[test]
+fn log_reports_the_latest_config_and_keeps_it_across_compaction() {
+    let path = test_log_path("log_config");
+    let bootstrap = ClusterConfig::new(vec![1, 2, 3]);
+    let changed = ClusterConfig {
+        voters: vec![1, 2, 3],
+        learners: vec![4],
+    };
+
+    let mut log = RaftLog::open_with_config(&path, bootstrap.clone()).expect("open");
+    assert_eq!(log.latest_config(), (0, bootstrap.clone()));
+
+    log.append(entry(1, "a", "1")).expect("append 1");
+    log.append(LogEntry {
+        term: 1,
+        command: Command::Config(changed.clone()),
+    })
+    .expect("append config at 2");
+    log.append(entry(1, "b", "2")).expect("append 3");
+
+    assert_eq!(log.latest_config(), (2, changed.clone()));
+    assert_eq!(
+        log.config_as_of(1),
+        (0, bootstrap.clone()),
+        "before the change"
+    );
+    assert_eq!(log.config_as_of(3), (2, changed.clone()));
+
+    // Dropping the config entry by compaction must not forget it.
+    log.compact_to(3, 1, changed.clone()).expect("compact");
+    assert_eq!(log.latest_config(), (0, changed.clone()));
+    drop(log);
+
+    // ...even though a restart is given a different bootstrap config.
+    let log = RaftLog::open_with_config(&path, bootstrap).expect("reopen");
+    assert_eq!(log.base_config(), &changed);
+    assert_eq!(log.latest_config().1, changed);
+}
+
+#[test]
+fn learner_receives_the_log_but_never_counts_toward_commit() {
+    let mut nodes = cluster_with_joiner("learner_commit");
+
+    elect(&mut nodes, 0, &[1]);
+    assert!(deliver(&mut nodes, 0, 1)); // commits the leader's no-op
+
+    let index = nodes[0]
+        .propose_config_change(ConfigChange::AddLearner(4))
+        .expect("add learner");
+    assert_eq!(
+        nodes[0].config().learners,
+        vec![4],
+        "effective once appended"
+    );
+    assert_eq!(nodes[0].quorum_size(), 2);
+
+    // The two voters commit it; the learner has acknowledged nothing.
+    assert!(deliver(&mut nodes, 0, 1));
+    assert_eq!(nodes[0].commit_index, index);
+    assert_eq!(nodes[0].match_index_of(4), Some(0));
+
+    // The learner catches up from the beginning and learns the config.
+    assert!(!nodes[3].is_voter());
+    while nodes[3].log.last_index() < nodes[0].log.last_index() {
+        assert!(deliver(&mut nodes, 0, 3));
+    }
+    assert_eq!(nodes[3].config(), nodes[0].config());
+    assert!(!nodes[3].is_voter(), "a learner is not a voter");
+
+    // A new entry that exists only on the leader and the learner is on 2
+    // servers, but only 1 of them is a voter: it must NOT commit.
+    let index = nodes[0]
+        .append_client_command(set("only", "learner"))
+        .expect("leader accepts command");
+    assert!(deliver(&mut nodes, 0, 3));
+    assert_eq!(nodes[3].log.last_index(), index);
+    assert!(
+        nodes[0].commit_index < index,
+        "a learner's copy must not count toward the majority"
+    );
+
+    // One more voter makes it a real majority.
+    assert!(deliver(&mut nodes, 0, 1));
+    assert_eq!(nodes[0].commit_index, index);
+}
+
+#[test]
+fn one_change_at_a_time_and_only_after_committing_in_the_leaders_term() {
+    let mut nodes = cluster_with_joiner("one_at_a_time");
+
+    elect(&mut nodes, 0, &[1]);
+
+    // The new leader's no-op is not committed yet.
+    assert!(
+        nodes[0]
+            .propose_config_change(ConfigChange::AddLearner(4))
+            .is_err(),
+        "must first commit an entry from the current term"
+    );
+
+    assert!(deliver(&mut nodes, 0, 1));
+
+    nodes[0]
+        .propose_config_change(ConfigChange::AddLearner(4))
+        .expect("first change");
+
+    assert!(
+        nodes[0]
+            .propose_config_change(ConfigChange::Remove(3))
+            .is_err(),
+        "the first change has not committed yet"
+    );
+
+    assert!(deliver(&mut nodes, 0, 1)); // commits it
+    nodes[0]
+        .propose_config_change(ConfigChange::Remove(3))
+        .expect("allowed once the previous change committed");
+}
+
+#[test]
+fn promoting_a_learner_raises_the_quorum_to_three_of_four() {
+    let mut nodes = cluster_with_joiner("promote");
+
+    elect(&mut nodes, 0, &[1]);
+    assert!(deliver(&mut nodes, 0, 1));
+
+    nodes[0]
+        .propose_config_change(ConfigChange::AddLearner(4))
+        .expect("add learner");
+    assert!(deliver(&mut nodes, 0, 1));
+    while nodes[3].log.last_index() < nodes[0].log.last_index() {
+        assert!(deliver(&mut nodes, 0, 3));
+    }
+
+    nodes[0]
+        .propose_config_change(ConfigChange::Promote(4))
+        .expect("promote");
+    assert_eq!(voters_of(&nodes[0]), vec![1, 2, 3, 4]);
+    assert_eq!(nodes[0].quorum_size(), 3);
+
+    // Leader + one follower is only 2 of 4: not committed.
+    let promote_index = nodes[0].log.last_index();
+    assert!(deliver(&mut nodes, 0, 1));
+    assert!(nodes[0].commit_index < promote_index);
+
+    // A third copy commits it.
+    assert!(deliver(&mut nodes, 0, 3));
+    assert_eq!(nodes[0].commit_index, promote_index);
+}
+
+#[test]
+fn a_server_that_knows_no_config_grants_votes_instead_of_vetoing() {
+    let mut nodes = cluster_with_joiner("empty_grants");
+
+    // Server 4 has never heard from a leader, so it knows no voters at all.
+    assert!(nodes[3].config().voters.is_empty());
+
+    let reply = nodes[3]
+        .handle_vote_request(RequestVoteArgs {
+            term: 1,
+            candidate_id: 2,
+            last_log_index: 0,
+            last_log_term: 0,
+        })
+        .expect("handle vote request");
+
+    assert!(
+        reply.vote_granted,
+        "it cannot know the candidate is not a voter"
+    );
+    assert_eq!(nodes[3].voted_for, Some(2));
+}
+
+#[test]
+fn learners_and_removed_servers_cannot_campaign_or_disturb_voters() {
+    let mut nodes = cluster_with_joiner("no_campaign");
+
+    // A joining server has no config: it must not start elections.
+    assert!(nodes[3].start_election().is_err());
+
+    // A voter ignores vote requests from a server outside its config, and
+    // does not even adopt its (higher) term.
+    let before = nodes[0].current_term;
+    let reply = nodes[0]
+        .handle_vote_request(RequestVoteArgs {
+            term: before + 5,
+            candidate_id: 4,
+            last_log_index: 0,
+            last_log_term: 0,
+        })
+        .expect("handle vote request");
+
+    assert!(!reply.vote_granted);
+    assert_eq!(nodes[0].current_term, before);
+}
+
+#[test]
+fn a_leader_that_removes_itself_steps_down_only_after_the_change_commits() {
+    let mut nodes = cluster("remove_leader");
+
+    elect(&mut nodes, 0, &[1]);
+    assert!(deliver(&mut nodes, 0, 1));
+
+    nodes[0]
+        .propose_config_change(ConfigChange::Remove(1))
+        .expect("leader removes itself");
+    assert_eq!(voters_of(&nodes[0]), vec![2, 3]);
+    assert_eq!(
+        nodes[0].role,
+        Role::Leader,
+        "still leading until it commits"
+    );
+
+    // The leader no longer counts itself: one follower is 1 of 2, not enough.
+    let index = nodes[0].log.last_index();
+    assert!(deliver(&mut nodes, 0, 1));
+    assert!(nodes[0].commit_index < index);
+    assert_eq!(nodes[0].role, Role::Leader);
+
+    // Both remaining voters have it: committed, so the old leader steps down.
+    assert!(deliver(&mut nodes, 0, 2));
+    assert_eq!(nodes[0].commit_index, index);
+    assert_eq!(nodes[0].role, Role::Follower);
+    assert!(!nodes[0].is_voter());
+}
+
+#[test]
+fn a_follower_drops_an_uncommitted_config_when_its_entry_is_overwritten() {
+    let mut node = RaftNode::open(2, members(), test_log_path("config_rollback")).expect("open");
+
+    let changed = ClusterConfig {
+        voters: vec![1, 2, 3],
+        learners: vec![4],
+    };
+
+    // Leader 1 (term 1) sends a no-op and a config change.
+    let reply = node
+        .handle_append_entries(AppendEntriesArgs {
+            term: 1,
+            leader_id: 1,
+            prev_log_index: 0,
+            prev_log_term: 0,
+            entries: vec![
+                LogEntry {
+                    term: 1,
+                    command: Command::Noop,
+                },
+                LogEntry {
+                    term: 1,
+                    command: Command::Config(changed.clone()),
+                },
+            ],
+            leader_commit: 0,
+        })
+        .expect("append");
+    assert!(reply.success);
+    assert_eq!(node.config(), &changed, "adopted as soon as it is appended");
+    assert!(node.has_pending_config());
+
+    // Leader 3 (term 2) never saw that entry and overwrites index 2.
+    let reply = node
+        .handle_append_entries(AppendEntriesArgs {
+            term: 2,
+            leader_id: 3,
+            prev_log_index: 1,
+            prev_log_term: 1,
+            entries: vec![entry(2, "x", "1")],
+            leader_commit: 0,
+        })
+        .expect("overwrite");
+    assert!(reply.success);
+
+    assert_eq!(
+        node.config(),
+        &ClusterConfig::new(members()),
+        "the rolled-back config must be forgotten"
+    );
+    assert!(!node.has_pending_config());
+}
+
+#[test]
+fn a_snapshot_carries_the_config_to_a_joining_server_and_restarts_keep_it() {
+    let mut nodes = cluster_with_joiner("snapshot_config");
+
+    elect(&mut nodes, 0, &[1]);
+    assert!(deliver(&mut nodes, 0, 1));
+    nodes[0]
+        .propose_config_change(ConfigChange::AddLearner(4))
+        .expect("add learner");
+    assert!(deliver(&mut nodes, 0, 1));
+
+    // The leader snapshots everything, dropping the config entry with it.
+    let applied = nodes[0].commit_index;
+    nodes[0].mark_applied(applied);
+    let term = nodes[0].log.term_at(applied).expect("term");
+    let config = nodes[0].config_as_of(applied);
+    assert_eq!(config.learners, vec![4]);
+
+    nodes[0].compact_log_to(applied, term).expect("compact");
+    assert!(nodes[0].needs_snapshot(4));
+
+    // The joiner installs that snapshot and learns the membership from it.
+    assert!(nodes[3].observe_leader(1, 1).expect("observe leader"));
+    nodes[3]
+        .finish_snapshot_install(applied, term, config.clone())
+        .expect("install snapshot");
+
+    assert_eq!(nodes[3].config(), &config);
+    assert_eq!(nodes[3].commit_index, applied);
+    assert!(!nodes[3].is_voter());
 }

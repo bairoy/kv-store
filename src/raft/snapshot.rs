@@ -9,10 +9,13 @@ use std::fs::File;
 use std::io::{self, Read};
 use std::path::Path;
 
-use crate::raft::codec::{invalid_data, put_string, put_u64, read_string, read_u64};
+use crate::raft::codec::{
+    invalid_data, put_config, put_string, put_u64, read_config, read_string, read_u64,
+};
 use crate::raft::fsutil::write_file_atomic;
+use crate::raft::types::ClusterConfig;
 
-const MAGIC: &[u8; 8] = b"RAFTSNP1";
+const MAGIC: &[u8; 8] = b"RAFTSNP2";
 const HEADER_SIZE: usize = 8 + 8 + 8 + 8;
 const MAX_SNAPSHOT_BYTES: u64 = 1024 * 1024 * 1024;
 
@@ -20,6 +23,9 @@ const MAX_SNAPSHOT_BYTES: u64 = 1024 * 1024 * 1024;
 pub struct RaftSnapshot {
     pub last_included_index: u64,
     pub last_included_term: u64,
+    /// Who was in the group as of `last_included_index`. Needed because the
+    /// config entries that established it are discarded with the log prefix.
+    pub config: ClusterConfig,
     pub entries: BTreeMap<String, String>,
 }
 
@@ -31,6 +37,7 @@ impl RaftSnapshot {
         put_u64(&mut out, self.last_included_index);
         put_u64(&mut out, self.last_included_term);
         put_u64(&mut out, self.entries.len() as u64);
+        put_config(&mut out, &self.config)?;
 
         for (key, value) in &self.entries {
             put_string(&mut out, key)?;
@@ -50,6 +57,7 @@ impl RaftSnapshot {
     pub fn decode(bytes: &[u8]) -> io::Result<Self> {
         let (last_included_index, last_included_term, count) = decode_header(bytes)?;
         let mut cursor = HEADER_SIZE;
+        let config = read_config(bytes, &mut cursor)?;
 
         // Every entry takes at least 8 bytes, so a larger count is corrupt.
         if count > bytes.len() as u64 {
@@ -74,6 +82,7 @@ impl RaftSnapshot {
         Ok(Self {
             last_included_index,
             last_included_term,
+            config,
             entries,
         })
     }
@@ -131,6 +140,10 @@ mod tests {
         RaftSnapshot {
             last_included_index: 42,
             last_included_term: 3,
+            config: ClusterConfig {
+                voters: vec![1, 2, 3],
+                learners: vec![4],
+            },
             entries: BTreeMap::from([
                 ("name".to_string(), "baiju".to_string()),
                 ("city".to_string(), "pune".to_string()),

@@ -9,6 +9,7 @@
 *.marker
 *_sstables/
 raft_data/
+shard_data/
 
 # reference material
 *.pdf

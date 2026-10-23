@@ -7,8 +7,8 @@ use crate::raft::{
     persistence::PersistentState,
     snapshot::RaftSnapshot,
     types::{
-        AppendEntriesArgs, AppendEntriesReply, Command, LogEntry, NodeId, RequestVoteArgs,
-        RequestVoteReply, Role,
+        AppendEntriesArgs, AppendEntriesReply, ClusterConfig, Command, ConfigChange, LogEntry,
+        NodeId, RequestVoteArgs, RequestVoteReply, Role,
     },
 };
 
@@ -28,7 +28,11 @@ pub struct RaftNode {
     /// Best-known leader for the current term (for redirecting clients).
     pub leader_id: Option<NodeId>,
 
-    members: Vec<NodeId>,
+    /// The cluster config in effect: the latest `Config` entry in the log
+    /// (committed or not), else the base / bootstrap config.
+    config: ClusterConfig,
+    /// Index of the entry that set `config` (0 = base or bootstrap).
+    config_index: u64,
     votes_received: HashSet<NodeId>,
     state_path: PathBuf,
     snapshot_path: PathBuf,
@@ -39,6 +43,10 @@ pub struct RaftNode {
 }
 
 impl RaftNode {
+    /// Open a node of a cluster whose initial voters are `members`.
+    ///
+    /// Once the log contains configuration entries they take over: `members`
+    /// is only the bootstrap config for a log that has none.
     pub fn open(id: NodeId, members: Vec<NodeId>, log_path: impl AsRef<Path>) -> io::Result<Self> {
         if members.is_empty() {
             return Err(invalid_input("cluster must have members"));
@@ -53,11 +61,26 @@ impl RaftNode {
             return Err(invalid_input("member IDs must be unique"));
         }
 
+        Self::open_with(id, ClusterConfig::new(members), log_path)
+    }
+
+    /// Open a server that is being added to an existing group. It has no
+    /// config yet, so it cannot campaign; it learns the real config from the
+    /// leader's log (or snapshot).
+    pub fn open_joining(id: NodeId, log_path: impl AsRef<Path>) -> io::Result<Self> {
+        Self::open_with(id, ClusterConfig::default(), log_path)
+    }
+
+    fn open_with(
+        id: NodeId,
+        bootstrap: ClusterConfig,
+        log_path: impl AsRef<Path>,
+    ) -> io::Result<Self> {
         let log_path = log_path.as_ref().to_path_buf();
         let state_path = log_path.with_extension("state");
         let snapshot_path = log_path.with_extension("snapshot");
         let persistent = PersistentState::load(&state_path)?;
-        let log = RaftLog::open(&log_path)?;
+        let log = RaftLog::open_with_config(&log_path, bootstrap)?;
 
         // A compacted log is only usable together with its snapshot.
         if log.base_index() > 0 {
@@ -78,6 +101,7 @@ impl RaftNode {
 
         // Everything in the snapshot was committed and applied.
         let snapshot_index = log.base_index();
+        let (config_index, config) = log.latest_config();
 
         Ok(Self {
             id,
@@ -88,7 +112,8 @@ impl RaftNode {
             commit_index: snapshot_index,
             last_applied: snapshot_index,
             leader_id: None,
-            members,
+            config,
+            config_index,
             votes_received: HashSet::new(),
             state_path,
             snapshot_path,
@@ -127,10 +152,63 @@ impl RaftNode {
     }
 
     pub fn quorum_size(&self) -> usize {
-        self.members.len() / 2 + 1
+        self.config.quorum()
+    }
+
+    /// The membership in effect right now.
+    pub fn config(&self) -> &ClusterConfig {
+        &self.config
+    }
+
+    /// Voters count toward elections and commitment; everyone else only
+    /// receives the log.
+    pub fn is_voter(&self) -> bool {
+        self.config.is_voter(self.id)
+    }
+
+    /// The config entry in effect is not committed yet, so no further change
+    /// may be proposed.
+    pub fn has_pending_config(&self) -> bool {
+        self.config_index > self.commit_index
+    }
+
+    /// The config as of log index `index` (what a snapshot at `index` records).
+    pub fn config_as_of(&self, index: u64) -> ClusterConfig {
+        self.log.config_as_of(index).1
+    }
+
+    /// Highest index known to be on `peer` (leader only).
+    pub fn match_index_of(&self, peer: NodeId) -> Option<u64> {
+        self.match_index.get(&peer).copied()
+    }
+
+    /// May this server run for leader?
+    ///
+    /// Yes if it is a voter in its latest config, **or** in the last
+    /// *committed* config. The second case matters when a leader appended
+    /// "remove myself" and crashed before the entry committed: it is no
+    /// longer a voter in its own log, yet the survivors may need its vote
+    /// (or its more up-to-date log) to elect anyone at all.
+    pub fn can_campaign(&self) -> bool {
+        self.config.is_voter(self.id)
+            || self.log.config_as_of(self.commit_index).1.is_voter(self.id)
+    }
+
+    /// Votes received from servers that are voters in our config. Only these
+    /// count: a candidate's own vote is worthless if it is not in the config
+    /// it is trying to win.
+    fn counted_votes(&self) -> usize {
+        self.votes_received
+            .iter()
+            .filter(|voter| self.config.is_voter(**voter))
+            .count()
     }
 
     pub fn start_election(&mut self) -> io::Result<RequestVoteArgs> {
+        if !self.can_campaign() {
+            return Err(io::Error::other("not a voting member of this group"));
+        }
+
         let next_term = self
             .current_term
             .checked_add(1)
@@ -154,7 +232,7 @@ impl RaftNode {
         self.votes_received.insert(self.id);
 
         // A single-node cluster already has a majority with its own vote.
-        if self.votes_received.len() >= self.quorum_size() {
+        if self.counted_votes() >= self.quorum_size() {
             self.become_leader()?;
         }
 
@@ -167,6 +245,28 @@ impl RaftNode {
     }
 
     pub fn handle_vote_request(&mut self, args: RequestVoteArgs) -> io::Result<RequestVoteReply> {
+        // A server we *know* is not a voter (for instance one that was removed
+        // and keeps timing out) must not disturb us: refuse without even
+        // adopting its term. But only refuse when we really know: a server
+        // that has no config yet (it is still joining), or whose config is
+        // merely out of date, would otherwise veto the very candidate it is
+        // supposed to help elect, and the group could never recover.
+        let knows_voters = !self.config.voters.is_empty();
+
+        if knows_voters
+            && !self.config.is_voter(args.candidate_id)
+            && !self
+                .log
+                .config_as_of(self.commit_index)
+                .1
+                .is_voter(args.candidate_id)
+        {
+            return Ok(RequestVoteReply {
+                term: self.current_term,
+                vote_granted: false,
+            });
+        }
+
         if args.term < self.current_term {
             return Ok(RequestVoteReply {
                 term: self.current_term,
@@ -218,13 +318,13 @@ impl RaftNode {
             return Ok(false);
         }
 
-        if !reply.vote_granted || !self.members.contains(&voter_id) {
+        if !reply.vote_granted || !self.config.is_voter(voter_id) {
             return Ok(false);
         }
 
         self.votes_received.insert(voter_id);
 
-        if self.votes_received.len() >= self.quorum_size() {
+        if self.counted_votes() >= self.quorum_size() {
             self.become_leader()?;
             return Ok(true);
         }
@@ -237,10 +337,104 @@ impl RaftNode {
             return Err(io::Error::other("not leader"));
         }
 
-        self.log.append(LogEntry {
+        if matches!(command, Command::Config(_)) {
+            return Err(io::Error::other(
+                "membership changes go through propose_config_change",
+            ));
+        }
+
+        let index = self.log.append(LogEntry {
             term: self.current_term,
             command,
-        })
+        })?;
+
+        // With a single voter the leader alone is a majority and no follower
+        // reply will ever arrive to trigger the commit.
+        self.advance_commit_from_progress();
+
+        Ok(index)
+    }
+
+    /// Leader: start one single-server membership change.
+    ///
+    /// Safe because (1) each change alters the voter set by at most one
+    /// server, so old and new majorities overlap; (2) only one change may be
+    /// in flight; (3) the leader must already have committed an entry from
+    /// its own term, otherwise it could be unaware of an uncommitted change
+    /// from an earlier leader (the known bug in the original single-server
+    /// proposal). The new config takes effect on this leader immediately.
+    /// Returns the log index of the config entry.
+    pub fn propose_config_change(&mut self, change: ConfigChange) -> io::Result<u64> {
+        if self.role != Role::Leader {
+            return Err(io::Error::other("not leader"));
+        }
+
+        if self.has_pending_config() {
+            return Err(io::Error::other(
+                "a configuration change is already in progress",
+            ));
+        }
+
+        if self.log.term_at(self.commit_index) != Some(self.current_term) {
+            return Err(io::Error::other(
+                "leader has not committed an entry in its term yet",
+            ));
+        }
+
+        let new_config = change
+            .apply(&self.config)
+            .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?;
+
+        let index = self.log.append(LogEntry {
+            term: self.current_term,
+            command: Command::Config(new_config.clone()),
+        })?;
+
+        self.config = new_config;
+        self.config_index = index;
+
+        // Start tracking any new server from the very beginning of the log
+        // (if that part was compacted, `needs_snapshot` will send a snapshot).
+        for peer in self.peers() {
+            self.next_index.entry(peer).or_insert(1);
+            self.match_index.entry(peer).or_insert(0);
+        }
+
+        // With a single voter the leader alone is a majority.
+        self.advance_commit_from_progress();
+
+        Ok(index)
+    }
+
+    /// Re-derive the config from the log. Needed whenever the log changes in
+    /// a way that might add, remove or *roll back* a config entry.
+    fn refresh_config(&mut self) {
+        let (index, config) = self.log.latest_config();
+
+        self.config_index = index;
+        self.config = config;
+    }
+
+    /// Housekeeping once `commit_index` has advanced: a leader that is no
+    /// longer in the (committed) config steps down, and a leader stops
+    /// tracking servers that were removed.
+    fn after_commit(&mut self) {
+        if self.role != Role::Leader || self.has_pending_config() {
+            return;
+        }
+
+        if !self.config.is_member(self.id) {
+            self.role = Role::Follower;
+            self.leader_id = None;
+            self.votes_received.clear();
+            self.next_index.clear();
+            self.match_index.clear();
+            return;
+        }
+
+        let members = self.config.members();
+        self.next_index.retain(|peer, _| members.contains(peer));
+        self.match_index.retain(|peer, _| members.contains(peer));
     }
 
     pub fn handle_append_entries(
@@ -269,6 +463,13 @@ impl RaftNode {
             self.commit_index,
         )?;
 
+        // Entries were possibly added, replaced or removed: the latest config
+        // entry in the log may have changed (a followers adopts a config as
+        // soon as it is appended, and drops it again if it is truncated).
+        if success && (!args.entries.is_empty()) {
+            self.refresh_config();
+        }
+
         if success {
             // Only entries confirmed by this request may be committed. Using
             // `last_index()` would also commit a stale tail the leader never
@@ -282,6 +483,8 @@ impl RaftNode {
                 .commit_index
                 .max(args.leader_commit.min(last_new_index));
         }
+
+        self.after_commit();
 
         Ok(AppendEntriesReply {
             term: self.current_term,
@@ -313,7 +516,9 @@ impl RaftNode {
             return Err(io::Error::other("cannot compact past the applied index"));
         }
 
-        self.log.compact_to(index, term)
+        let config = self.log.config_as_of(index).1;
+
+        self.log.compact_to(index, term, config)
     }
 
     /// True if `peer` needs entries that were already compacted away.
@@ -350,8 +555,14 @@ impl RaftNode {
     }
 
     /// Call after the snapshot is saved and the state machine replaced.
-    pub fn finish_snapshot_install(&mut self, index: u64, term: u64) -> io::Result<()> {
-        self.log.compact_to(index, term)?;
+    pub fn finish_snapshot_install(
+        &mut self,
+        index: u64,
+        term: u64,
+        config: ClusterConfig,
+    ) -> io::Result<()> {
+        self.log.compact_to(index, term, config)?;
+        self.refresh_config();
 
         self.commit_index = self.commit_index.max(index);
         self.last_applied = index;
@@ -392,12 +603,23 @@ impl RaftNode {
         Ok(())
     }
 
-    /// Ids of every other member of the cluster.
+    /// Every other server the leader must send the log to (voters and learners).
     pub fn peers(&self) -> Vec<NodeId> {
-        self.members
+        self.config
+            .members()
+            .into_iter()
+            .filter(|member| *member != self.id)
+            .collect()
+    }
+
+    /// Other *voters* only: whom to ask for votes, and whose acknowledgements
+    /// count for a read barrier.
+    pub fn voter_peers(&self) -> Vec<NodeId> {
+        self.config
+            .voters
             .iter()
             .copied()
-            .filter(|member| *member != self.id)
+            .filter(|voter| *voter != self.id)
             .collect()
     }
 
@@ -526,7 +748,8 @@ impl RaftNode {
             }
 
             let replicated_count = self
-                .members
+                .config
+                .voters
                 .iter()
                 .filter(|member| {
                     if **member == self.id {
@@ -544,5 +767,7 @@ impl RaftNode {
                 break;
             }
         }
+
+        self.after_commit();
     }
 }
