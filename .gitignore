@@ -13,3 +13,5 @@ shard_data/
 
 # reference material
 *.pdf
+# documentation notes (local only)
+*.md
