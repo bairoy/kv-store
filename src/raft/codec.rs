@@ -1,16 +1,19 @@
 //! Binary encoding helpers shared by the Raft log and the Raft RPC messages.
-//!
-//! All integers are big-endian; strings are a `u32` byte length plus UTF-8.
 
 use std::io;
 
-use crate::raft::types::{ClusterConfig, Command, LogEntry, NodeId, TxnCommand, TxnOp};
+use crate::raft::types::{ClusterConfig, Command, LogEntry, NodeId, SessionOp, TxnCommand, TxnOp};
 
 const COMMAND_SET: u8 = 1;
 const COMMAND_DELETE: u8 = 2;
 const COMMAND_NOOP: u8 = 3;
 const COMMAND_CONFIG: u8 = 4;
 const COMMAND_TXN: u8 = 5;
+const COMMAND_SESSION: u8 = 6;
+
+const SESSION_SET: u8 = 1;
+const SESSION_DELETE: u8 = 2;
+const SESSION_INCR: u8 = 3;
 
 const TXN_PREPARE: u8 = 1;
 const TXN_DECIDE: u8 = 2;
@@ -72,12 +75,53 @@ pub fn put_command(out: &mut Vec<u8>, command: &Command) -> io::Result<()> {
             out.push(COMMAND_TXN);
             put_txn(out, txn)?;
         }
+        Command::Session { client, seq, op } => {
+            out.push(COMMAND_SESSION);
+            put_string(out, client)?;
+            put_u64(out, *seq);
+            put_session_op(out, op)?;
+        }
     }
 
     Ok(())
 }
 
-/// Transaction step: a tag byte, then its fields.
+fn put_session_op(out: &mut Vec<u8>, op: &SessionOp) -> io::Result<()> {
+    match op {
+        SessionOp::Set { key, value } => {
+            out.push(SESSION_SET);
+            put_string(out, key)?;
+            put_string(out, value)?;
+        }
+        SessionOp::Delete { key } => {
+            out.push(SESSION_DELETE);
+            put_string(out, key)?;
+        }
+        SessionOp::Incr { key } => {
+            out.push(SESSION_INCR);
+            put_string(out, key)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn read_session_op(bytes: &[u8], cursor: &mut usize) -> io::Result<SessionOp> {
+    match read_u8(bytes, cursor)? {
+        SESSION_SET => Ok(SessionOp::Set {
+            key: read_string(bytes, cursor)?,
+            value: read_string(bytes, cursor)?,
+        }),
+        SESSION_DELETE => Ok(SessionOp::Delete {
+            key: read_string(bytes, cursor)?,
+        }),
+        SESSION_INCR => Ok(SessionOp::Incr {
+            key: read_string(bytes, cursor)?,
+        }),
+        _ => Err(invalid_data("unknown session operation type")),
+    }
+}
+
 pub fn put_txn(out: &mut Vec<u8>, txn: &TxnCommand) -> io::Result<()> {
     match txn {
         TxnCommand::Prepare {
@@ -112,7 +156,6 @@ pub fn put_txn(out: &mut Vec<u8>, txn: &TxnCommand) -> io::Result<()> {
     Ok(())
 }
 
-/// `[u32 count]` of a list.
 fn put_count(out: &mut Vec<u8>, count: usize) -> io::Result<()> {
     let count = u32::try_from(count)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "list is too long"))?;
@@ -142,7 +185,6 @@ pub fn put_ops(out: &mut Vec<u8>, ops: &[TxnOp]) -> io::Result<()> {
     Ok(())
 }
 
-/// `[u32 voter count][ids...][u32 learner count][ids...]`
 pub fn put_config(out: &mut Vec<u8>, config: &ClusterConfig) -> io::Result<()> {
     for list in [&config.voters, &config.learners] {
         let count = u32::try_from(list.len())
@@ -158,7 +200,6 @@ pub fn put_config(out: &mut Vec<u8>, config: &ClusterConfig) -> io::Result<()> {
     Ok(())
 }
 
-/// Term followed by the command; the log prepends its own index.
 pub fn put_entry(out: &mut Vec<u8>, entry: &LogEntry) -> io::Result<()> {
     put_u64(out, entry.term);
     put_command(out, &entry.command)
@@ -247,8 +288,6 @@ pub fn read_config(bytes: &[u8], cursor: &mut usize) -> io::Result<ClusterConfig
     for list in &mut lists {
         let count = read_u32(bytes, cursor)? as usize;
 
-        // Each id takes 8 bytes: a larger count cannot be real, and must not
-        // be allowed to drive a huge allocation.
         if count > bytes.len().saturating_sub(*cursor) / 8 {
             return Err(invalid_data("server list is longer than the record"));
         }
@@ -266,7 +305,6 @@ pub fn read_config(bytes: &[u8], cursor: &mut usize) -> io::Result<ClusterConfig
 pub fn read_ops(bytes: &[u8], cursor: &mut usize) -> io::Result<Vec<TxnOp>> {
     let count = read_u32(bytes, cursor)? as usize;
 
-    // Every op takes at least 5 bytes.
     if count > bytes.len().saturating_sub(*cursor) / 5 {
         return Err(invalid_data("op list is longer than the record"));
     }
@@ -345,6 +383,11 @@ pub fn read_command(bytes: &[u8], cursor: &mut usize) -> io::Result<Command> {
         COMMAND_NOOP => Ok(Command::Noop),
         COMMAND_CONFIG => Ok(Command::Config(read_config(bytes, cursor)?)),
         COMMAND_TXN => Ok(Command::Txn(read_txn(bytes, cursor)?)),
+        COMMAND_SESSION => Ok(Command::Session {
+            client: read_string(bytes, cursor)?,
+            seq: read_u64(bytes, cursor)?,
+            op: read_session_op(bytes, cursor)?,
+        }),
         _ => Err(invalid_data("unknown Raft command type")),
     }
 }

@@ -22,14 +22,10 @@ pub struct Sstable {
 }
 
 impl Sstable {
-    /// Create an SSTable from the current Memtable.
     pub fn create(path: &Path, memtable: &Memtable) -> io::Result<Self> {
         Self::create_from_entries(path, memtable.iter())
     }
 
-    /// Create an SSTable from sorted key-value entries.
-    ///
-    /// The entries are expected to be sorted by key.
     pub fn create_from_entries<'a, I>(path: &Path, entries: I) -> io::Result<Self>
     where
         I: IntoIterator<Item = (&'a String, &'a Option<String>)>,
@@ -45,16 +41,13 @@ impl Sstable {
 
         let mut index_entries = Vec::new();
 
-        // Current byte position in the SSTable.
         let mut offset: u64 = 0;
 
         for (position, (key, value)) in entries.iter().enumerate() {
-            // Every Nth key becomes an index entry.
-            if position % SPARSE_INDEX_INTERVAL == 0 {
+            if position.is_multiple_of(SPARSE_INDEX_INTERVAL) {
                 index_entries.push(((*key).clone(), offset));
             }
 
-            // Add key to Bloom filter.
             bloom.insert(key);
 
             let line = match value {
@@ -72,13 +65,10 @@ impl Sstable {
             offset += line.len() as u64;
         }
 
-        // Flush Rust's buffered data to the OS.
         writer.flush()?;
 
-        // Make the SSTable durable.
         writer.get_ref().sync_all()?;
 
-        // Atomically install the completed SSTable.
         fs::rename(&temp_path, path)?;
 
         Ok(Self {
@@ -88,10 +78,6 @@ impl Sstable {
         })
     }
 
-    /// Open an existing SSTable.
-    ///
-    /// The sparse index and Bloom filter are rebuilt by scanning
-    /// the SSTable once.
     pub fn open(path: PathBuf) -> io::Result<Self> {
         let mut index_entries = Vec::new();
         let mut bloom_keys = Vec::new();
@@ -113,12 +99,10 @@ impl Sstable {
 
             let (key, _) = parse_record(&line)?;
 
-            // Rebuild sparse index.
-            if position % SPARSE_INDEX_INTERVAL == 0 {
+            if position.is_multiple_of(SPARSE_INDEX_INTERVAL) {
                 index_entries.push((key.clone(), offset));
             }
 
-            // Rebuild Bloom filter.
             bloom_keys.push(key);
 
             offset += bytes_read as u64;
@@ -150,20 +134,11 @@ impl Sstable {
         &self.bloom
     }
 
-    /// Search for a key using:
-    ///
-    /// Bloom filter
-    ///      ↓
-    /// Sparse index
-    ///      ↓
-    /// Bounded disk scan
     pub fn get(&self, key: &str) -> io::Result<Option<SstableEntry>> {
-        // Bloom says definitely absent.
         if !self.bloom.might_contain(key) {
             return Ok(None);
         }
 
-        // Find the byte range where the key could exist.
         let (start, end) = match self.index.range_for(key) {
             Some(range) => range,
             None => return Ok(None),
@@ -172,17 +147,15 @@ impl Sstable {
         let file = File::open(&self.path)?;
         let mut reader = BufReader::new(file);
 
-        // Jump directly to the approximate location.
         reader.seek(SeekFrom::Start(start))?;
 
         loop {
             let current_offset = reader.stream_position()?;
 
-            // We reached the next sparse-index boundary.
-            if let Some(end_offset) = end {
-                if current_offset >= end_offset {
-                    break;
-                }
+            if let Some(end_offset) = end
+                && current_offset >= end_offset
+            {
+                break;
             }
 
             let mut line = String::new();
@@ -209,8 +182,6 @@ impl Sstable {
                 }
 
                 std::cmp::Ordering::Greater => {
-                    // Because SSTable is sorted, the key
-                    // cannot appear later.
                     break;
                 }
             }
@@ -219,9 +190,6 @@ impl Sstable {
         Ok(None)
     }
 
-    /// Read the entire SSTable.
-    ///
-    /// Primarily used by compaction.
     pub fn read_all(&self) -> io::Result<Vec<(String, Option<String>)>> {
         let file = File::open(&self.path)?;
         let reader = BufReader::new(file);
@@ -240,15 +208,6 @@ impl Sstable {
     }
 }
 
-/// Parse one SSTable record.
-///
-/// Format:
-///
-/// SET <tab> key <tab> value
-///
-/// or
-///
-/// DEL <tab> key
 fn parse_record(line: &str) -> io::Result<(String, Option<String>)> {
     let line = line.trim_end_matches('\n').trim_end_matches('\r');
 
@@ -341,14 +300,6 @@ mod tests {
 
         let table = Sstable::create_from_entries(&path, entries.iter()).unwrap();
 
-        // 300 entries / interval 128:
-        //
-        // positions:
-        // 0
-        // 128
-        // 256
-        //
-        // => 3 index entries
         assert_eq!(table.index().len(), 3);
 
         let _ = fs::remove_file(path);
@@ -372,7 +323,6 @@ mod tests {
 
         drop(table);
 
-        // Simulate restart.
         let reopened = Sstable::open(path.clone()).unwrap();
 
         assert_eq!(reopened.index().len(), original_index_len);

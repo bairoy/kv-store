@@ -8,15 +8,6 @@ impl SparseIndex {
         Self { entries }
     }
 
-    /// Find the byte range where `key` could exist.
-    ///
-    /// Returns:
-    ///     Some((start, end))
-    ///
-    /// `start` is the offset where scanning should begin.
-    /// `end` is the offset where scanning should stop.
-    ///
-    /// `None` means the key cannot exist in this SSTable.
     pub fn range_for(&self, key: &str) -> Option<(u64, Option<u64>)> {
         if self.entries.is_empty() {
             return None;
@@ -26,7 +17,6 @@ impl SparseIndex {
             .entries
             .binary_search_by(|(indexed_key, _)| indexed_key.as_str().cmp(key))
         {
-            // Exact indexed key.
             Ok(index) => {
                 let start = self.entries[index].1;
 
@@ -35,13 +25,8 @@ impl SparseIndex {
                 Some((start, end))
             }
 
-            // Key is smaller than the first indexed key.
-            //
-            // Since the first indexed key is also the first key
-            // in the SSTable, the requested key cannot exist.
             Err(0) => None,
 
-            // Key lies between two indexed keys.
             Err(index) => {
                 let start = self.entries[index - 1].1;
 

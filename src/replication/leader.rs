@@ -32,10 +32,6 @@ impl Leader {
         })
     }
 
-    /// Reapply the durable replication log to the local store.
-    ///
-    /// Call this once during startup, before accepting client writes.
-    /// SET and DELETE are replayed in log order.
     pub async fn recover(&self) -> io::Result<()> {
         let entries = {
             let log = self.log.lock().await;
@@ -61,7 +57,6 @@ impl Leader {
     async fn append_and_apply(&self, operation: LogEntry) -> io::Result<ReplicationEntry> {
         let _write_guard = self.write_lock.lock().await;
 
-        // The replication log is made durable before applying the write.
         let entry = {
             let mut log = self.log.lock().await;
             log.append(operation)?
@@ -77,9 +72,6 @@ impl Leader {
         };
 
         if let Err(error) = apply_result {
-            // The operation is already durable in the replication log.
-            // The caller must treat this leader as unhealthy and recover
-            // before accepting more writes.
             return Err(io::Error::other(format!(
                 "durable replication entry {} could not be applied: {error}",
                 entry.offset
@@ -91,7 +83,6 @@ impl Leader {
             entry.offset
         );
 
-        // Publish only after the durable log append and local application.
         let _ = self.replication_tx.send(entry.clone());
 
         Ok(entry)
@@ -206,8 +197,6 @@ impl Leader {
             follower_offset
         );
 
-        // Subscribe before reading catch-up history so writes that occur
-        // during catch-up are also observable through the receiver.
         let mut live_rx = self.replication_tx.subscribe();
 
         let catch_up = {
@@ -259,8 +248,6 @@ impl Leader {
                         continue;
                     }
 
-                    // If a broadcast was missed, fetch the missing durable
-                    // entries rather than assuming the channel is the log.
                     if entry.offset != last_sent + 1 {
                         let missing = {
                             let log = self.log.lock().await;
@@ -321,7 +308,6 @@ impl Leader {
         }
     }
     pub async fn create_snapshot(&self) -> io::Result<Snapshot> {
-        // Prevent a write from landing between offset capture and state capture.
         let _write_guard = self.write_lock.lock().await;
 
         let last_included_offset = {

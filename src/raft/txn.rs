@@ -1,28 +1,4 @@
 //! The state-machine half of cross-partition transactions (two-phase commit).
-//!
-//! The replicated log orders three kinds of step (`TxnCommand`); this module
-//! says what each one *does* to a partition's key-value store. Every piece of
-//! transaction state lives in the store itself, under a reserved key prefix,
-//! so it is made durable, snapshotted and recovered by the machinery that
-//! already protects ordinary data.
-//!
-//! ```text
-//! \u{1}txn:rec:<id>        the writes this partition promised to apply
-//! \u{1}txn:lock:<key>      <id> of the transaction that has locked <key>
-//! \u{1}txn:vote:<id>       YES / NO   (this partition's phase-1 answer)
-//! \u{1}txn:decision:<id>   COMMIT / ABORT   (coordinator partition only)
-//! \u{1}txn:done:<id>       COMMIT / ABORT   (tombstone: finished here)
-//! ```
-//!
-//! Every step is **idempotent**: after a crash, entries are re-applied from
-//! the log, and applying one twice must leave the same state.
-//!
-//! What this gives, and what it does not: a transaction is atomic across
-//! partitions (all writes happen or none), conflicting transactions cannot
-//! interleave (locks; the loser aborts instead of waiting, so no deadlock),
-//! and the decision survives crashes (it is a Raft entry). Plain reads and
-//! plain single-key writes do not look at the locks, so a reader can briefly
-//! see one partition's part of a transaction before another's.
 
 use std::io;
 
@@ -32,7 +8,6 @@ use crate::storage::lsm::LsmStore;
 
 const PREFIX: &str = "\u{1}txn:";
 
-/// A list of writes as one hex word (safe inside a space-separated command).
 pub fn ops_to_hex(ops: &[TxnOp]) -> io::Result<String> {
     let mut bytes = Vec::new();
     put_ops(&mut bytes, ops)?;
@@ -67,9 +42,8 @@ fn hex_decode(text: &str) -> io::Result<Vec<u8>> {
         .map_err(|_| invalid_data("malformed hex"))
 }
 
-/// Keys users may not touch: they hold transaction bookkeeping.
 pub fn is_reserved(key: &str) -> bool {
-    key.starts_with(PREFIX)
+    key.starts_with('\u{1}')
 }
 
 fn record_key(id: &str) -> String {
@@ -92,7 +66,6 @@ fn done_key(id: &str) -> String {
     format!("{PREFIX}done:{id}")
 }
 
-/// What a partition has promised for a prepared transaction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingTxn {
     pub id: String,
@@ -146,8 +119,6 @@ impl PendingTxn {
     }
 }
 
-/// What applying a step changed about the set of in-flight transactions, so
-/// the server can keep its in-memory index current without rescanning.
 #[derive(Debug, PartialEq, Eq)]
 pub enum TxnEffect {
     Nothing,
@@ -155,7 +126,6 @@ pub enum TxnEffect {
     Finished(String),
 }
 
-/// Apply one replicated step to the store. Idempotent.
 pub fn apply(store: &mut LsmStore, command: &TxnCommand) -> io::Result<TxnEffect> {
     match command {
         TxnCommand::Prepare {
@@ -164,14 +134,10 @@ pub fn apply(store: &mut LsmStore, command: &TxnCommand) -> io::Result<TxnEffect
             participants,
             ops,
         } => {
-            // Already voted (a replay) or already finished (a Prepare that
-            // arrived late, after the transaction was aborted): ignore.
             if store.get(&vote_key(id)).is_some() || store.get(&done_key(id)).is_some() {
                 return Ok(TxnEffect::Nothing);
             }
 
-            // Another transaction holds one of these keys: vote NO. We never
-            // wait for a lock, so two transactions cannot deadlock.
             let conflict = ops
                 .iter()
                 .any(|op| matches!(store.get(&lock_key(op.key())), Some(holder) if holder != *id));
@@ -193,15 +159,12 @@ pub fn apply(store: &mut LsmStore, command: &TxnCommand) -> io::Result<TxnEffect
             }
             store.set(record_key(id), pending.encode()?)?;
 
-            // The vote is written last: until it exists, a replay redoes the
-            // (idempotent) steps above.
             store.set(vote_key(id), "YES".to_string())?;
 
             Ok(TxnEffect::Prepared(pending))
         }
 
         TxnCommand::Decide { id, commit } => {
-            // The first decision wins; it is the transaction's commit point.
             if store.get(&decision_key(id)).is_none() {
                 let outcome = if *commit { "COMMIT" } else { "ABORT" };
                 store.set(decision_key(id), outcome.to_string())?;
@@ -250,12 +213,9 @@ pub fn apply(store: &mut LsmStore, command: &TxnCommand) -> io::Result<TxnEffect
     }
 }
 
-/// The answer a step produced, read back after it was applied: the vote for a
-/// `Prepare`, the winning decision for a `Decide`, `OK` for a `Finish`.
 pub fn outcome(store: &LsmStore, command: &TxnCommand) -> String {
     match command {
         TxnCommand::Prepare { id, .. } => store.get(&vote_key(id)).unwrap_or_else(|| {
-            // No vote and no lock means the transaction already finished.
             if store.get(&done_key(id)).is_some() {
                 "NO".to_string()
             } else {
@@ -269,14 +229,10 @@ pub fn outcome(store: &LsmStore, command: &TxnCommand) -> String {
     }
 }
 
-/// The recorded decision for `id`, if this partition is its coordinator and
-/// one was made.
 pub fn decision(store: &LsmStore, id: &str) -> Option<String> {
     store.get(&decision_key(id))
 }
 
-/// Every transaction this partition has prepared but not finished. Used when
-/// a server starts, or installs a snapshot, to rebuild its in-memory index.
 pub fn scan_pending(store: &LsmStore) -> io::Result<Vec<PendingTxn>> {
     let prefix = record_key("");
     let mut pending = Vec::new();
@@ -352,7 +308,6 @@ mod tests {
         ));
         assert_eq!(outcome(&store, &command), "YES");
 
-        // Nothing is visible until the transaction finishes.
         assert_eq!(store.get("a"), None);
         assert_eq!(store.get("old"), Some("x".into()));
 
@@ -365,7 +320,6 @@ mod tests {
         assert_eq!(store.get("old"), None);
         assert!(scan_pending(&store).unwrap().is_empty());
 
-        // The key is free again for the next transaction.
         let next = prepare("t2", vec![set("a", "2")]);
         apply(&mut store, &next).unwrap();
         assert_eq!(outcome(&store, &next), "YES");
@@ -399,12 +353,10 @@ mod tests {
         assert_eq!(apply(&mut store, &rival).unwrap(), TxnEffect::Nothing);
         assert_eq!(outcome(&store, &rival), "NO");
 
-        // The rival took none of its locks.
         let free = prepare("t3", vec![set("other", "y")]);
         apply(&mut store, &free).unwrap();
         assert_eq!(outcome(&store, &free), "YES");
 
-        // Finishing the loser must not disturb the winner's lock.
         apply(&mut store, &finish("t2", false)).unwrap();
         let still_locked = prepare("t4", vec![set("shared", "3")]);
         apply(&mut store, &still_locked).unwrap();
@@ -427,7 +379,6 @@ mod tests {
             TxnEffect::Nothing
         );
 
-        // A plain write after the commit must not be overwritten by a replay.
         store.set("a".into(), "changed".into()).unwrap();
         apply(&mut store, &finish("t1", true)).unwrap();
         assert_eq!(store.get("a"), Some("changed".into()));
@@ -439,7 +390,6 @@ mod tests {
     fn a_prepare_that_arrives_after_the_transaction_ended_is_ignored() {
         let (mut store, dir) = open_store("late_prepare");
 
-        // The transaction was aborted before this partition saw its Prepare.
         apply(&mut store, &finish("t1", false)).unwrap();
 
         let late = prepare("t1", vec![set("a", "1")]);

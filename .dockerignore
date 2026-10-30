@@ -1,0 +1,13 @@
+target
+.git
+.github
+chaos_data
+shard_data
+raft_data
+certs
+secrets
+*.md
+*.pdf
+*.log
+Dockerfile*
+docker-compose*.yml

@@ -1,12 +1,5 @@
 //! A hash function every node agrees on.
-//!
-//! Routing only works if all servers compute the *same* hash for the same
-//! key. `std`'s `DefaultHasher` is not stable across Rust versions and
-//! `RandomState` is seeded per process, so neither may be used here.
 
-/// FNV-1a followed by the splitmix64 finalizer (which spreads nearby inputs
-/// across the whole `u64` range). Fixed constants, fixed algorithm: the same
-/// input gives the same output on every machine and Rust version.
 pub fn stable_hash(input: &str) -> u64 {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
 
@@ -25,8 +18,6 @@ pub fn stable_hash(input: &str) -> u64 {
 mod tests {
     use super::*;
 
-    /// If these ever change, every deployed cluster would disagree about who
-    /// owns which key. They are pinned on purpose.
     #[test]
     fn hash_values_are_pinned() {
         assert_eq!(stable_hash(""), 0xf52a_15e9_a9b5_e89b);
@@ -41,7 +32,6 @@ mod tests {
         let a = stable_hash("user:1");
         let b = stable_hash("user:2");
 
-        // Differ in many bits, not just the last few.
         assert!((a ^ b).count_ones() > 16);
     }
 }

@@ -9,18 +9,10 @@ use crate::raft::types::{ClusterConfig, Command, LogEntry};
 const HEADER_SIZE: u64 = 4;
 const MAX_RECORD_SIZE: usize = 1024 * 1024;
 
-/// Current format: magic, base index, base term, then the cluster config
-/// as of the base. (`RBAS` is the old format without a config.)
 const BASE_MAGIC: &[u8; 4] = b"RBS2";
 const LEGACY_BASE_MAGIC: &[u8; 4] = b"RBAS";
 const LEGACY_BASE_FILE_SIZE: usize = 4 + 8 + 8;
 
-/// Durable Raft log with support for discarding a compacted prefix.
-///
-/// Entries `1..=base_index` have been folded into a snapshot and are gone.
-/// The remaining entries are `base_index + 1..=last_index()`. The snapshot
-/// position `(base_index, base_term)` lives in a small side file so it
-/// survives restarts even when no entries remain.
 #[derive(Debug)]
 pub struct RaftLog {
     path: PathBuf,
@@ -28,7 +20,6 @@ pub struct RaftLog {
     base_path: PathBuf,
     base_index: u64,
     base_term: u64,
-    /// The cluster config as of `base_index` (or the bootstrap config).
     base_config: ClusterConfig,
     entries: Vec<LogEntry>,
     record_positions: Vec<u64>,
@@ -39,8 +30,6 @@ impl RaftLog {
         Self::open_with_config(path, ClusterConfig::default())
     }
 
-    /// `bootstrap` is the cluster config to assume when the log holds no
-    /// config entry and no compaction has happened yet.
     pub fn open_with_config(path: impl AsRef<Path>, bootstrap: ClusterConfig) -> io::Result<Self> {
         let path = path.as_ref().to_path_buf();
         let base_path = path.with_extension("base");
@@ -91,8 +80,6 @@ impl RaftLog {
 
             let (index, entry) = decode_entry(&payload)?;
 
-            // A crash after the base was written but before the log file was
-            // rewritten leaves records the snapshot already covers; skip them.
             if index <= base_index {
                 position = record_end;
                 continue;
@@ -109,7 +96,6 @@ impl RaftLog {
             position = record_end;
         }
 
-        // Discard an incomplete trailing record, if one exists.
         if position < file_len {
             file.set_len(position)?;
             file.sync_all()?;
@@ -129,29 +115,22 @@ impl RaftLog {
         })
     }
 
-    /// Index of the last entry folded into the snapshot (0 if none).
     pub fn base_index(&self) -> u64 {
         self.base_index
     }
 
-    /// Term of the entry at `base_index` (0 if none).
     pub fn base_term(&self) -> u64 {
         self.base_term
     }
 
-    /// The cluster config as of `base_index`.
     pub fn base_config(&self) -> &ClusterConfig {
         &self.base_config
     }
 
-    /// The cluster config in effect at the end of the log, with the index of
-    /// the entry that set it (0 if it comes from the base / bootstrap).
     pub fn latest_config(&self) -> (u64, ClusterConfig) {
         self.config_as_of(self.last_index())
     }
 
-    /// The config in effect once entries `..=index` have been applied: the
-    /// latest `Config` entry at or before `index`, else the base config.
     pub fn config_as_of(&self, index: u64) -> (u64, ClusterConfig) {
         let last = index.min(self.last_index());
 
@@ -168,7 +147,6 @@ impl RaftLog {
         (0, self.base_config.clone())
     }
 
-    /// Index of the first entry still stored in the log.
     pub fn first_index(&self) -> u64 {
         self.base_index + 1
     }
@@ -183,8 +161,6 @@ impl RaftLog {
             .map_or(self.base_term, |entry| entry.term)
     }
 
-    /// Term at `index`. The snapshot boundary itself is answered from the
-    /// base; anything older than that is no longer known.
     pub fn term_at(&self, index: u64) -> Option<u64> {
         if index == self.base_index {
             return Some(self.base_term);
@@ -202,8 +178,6 @@ impl RaftLog {
         self.entries.get(position)
     }
 
-    /// Entries from `start_index` on. Indices already compacted are not
-    /// returned; callers that need them must send a snapshot instead.
     pub fn entries_from(&self, start_index: u64) -> Vec<LogEntry> {
         let start_index = start_index.max(self.first_index());
 
@@ -237,12 +211,15 @@ impl RaftLog {
         let result = (|| {
             self.file.write_all(&length.to_be_bytes())?;
             self.file.write_all(&payload)?;
+
+            let started = std::time::Instant::now();
             self.file.sync_all()?;
+            crate::metrics::observe_duration("raft_log_fsync_seconds", &[], started.elapsed());
+
             Ok::<(), io::Error>(())
         })();
 
         if let Err(error) = result {
-            // Restore the previous record boundary after a failed append.
             self.file.set_len(position)?;
             self.file.sync_all()?;
             self.file.seek(SeekFrom::End(0))?;
@@ -280,14 +257,6 @@ impl RaftLog {
         Ok(())
     }
 
-    /// Fold everything up to `index` (whose term is `term`) into a snapshot.
-    ///
-    /// `config` is the cluster config as of `index` (it must travel with the
-    /// snapshot, since the config entries being dropped are the only record
-    /// of it). The caller must already have made the snapshot durable. If the
-    /// log has a matching entry at `index` the later entries are kept;
-    /// otherwise (the snapshot is ahead of, or disagrees with, this log) the
-    /// whole log is discarded.
     pub fn compact_to(&mut self, index: u64, term: u64, config: ClusterConfig) -> io::Result<()> {
         if index <= self.base_index {
             return Ok(());
@@ -308,11 +277,8 @@ impl RaftLog {
 
         let kept: Vec<LogEntry> = self.entries[dropped..].to_vec();
 
-        // 1. Record the new base durably. From here on, older records in the
-        //    file are ignored on open, so a crash below is harmless.
         write_file_atomic(&self.base_path, &encode_base(index, term, &config)?)?;
 
-        // 2. Rewrite the log file with only the kept entries.
         let temp_path = temp_path_for(&self.path);
         let mut positions = Vec::with_capacity(kept.len());
 
@@ -368,8 +334,6 @@ impl RaftLog {
         let mut prev_log_term = prev_log_term;
         let mut incoming = incoming;
 
-        // Entries at or below the snapshot are committed and already folded
-        // in; skip them and continue from the snapshot boundary.
         if prev_log_index < self.base_index {
             let skip = usize::try_from(self.base_index - prev_log_index)
                 .unwrap_or(usize::MAX)
@@ -379,14 +343,12 @@ impl RaftLog {
             prev_log_index = prev_log_index.saturating_add(skip as u64);
 
             if prev_log_index < self.base_index {
-                // The whole batch lies inside the snapshot.
                 return Ok(true);
             }
 
             prev_log_term = self.base_term;
         }
 
-        // The preceding entry must match before this batch is accepted.
         if self.term_at(prev_log_index) != Some(prev_log_term) {
             return Ok(false);
         }
@@ -402,7 +364,6 @@ impl RaftLog {
 
             match self.entry_at(index) {
                 Some(existing) if existing.term == incoming_entry.term => {
-                    // Same index and term must identify the same entry.
                     if existing != incoming_entry {
                         return Err(invalid_data(
                             "conflicting commands have the same Raft index and term",
@@ -451,8 +412,6 @@ fn encode_base(index: u64, term: u64, config: &ClusterConfig) -> io::Result<Vec<
     Ok(out)
 }
 
-/// `(index, term, config)`. A missing file means "never compacted"; the
-/// config is `None` for the legacy format (the caller's bootstrap applies).
 fn load_base(path: &Path) -> io::Result<(u64, u64, Option<ClusterConfig>)> {
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,

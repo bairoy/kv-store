@@ -18,17 +18,31 @@ pub enum Command {
     Delete {
         key: String,
     },
-    /// Appended by a new leader so entries from older terms can be committed.
     Noop,
-    /// One step of a cross-partition transaction (two-phase commit); the
-    /// logic lives in `raft::txn`.
     Txn(TxnCommand),
-    /// A change of cluster membership. A server uses the *latest* config entry
-    /// in its log as soon as the entry is appended (committed or not).
     Config(ClusterConfig),
+    Session {
+        client: String,
+        seq: u64,
+        op: SessionOp,
+    },
 }
 
-/// One write inside a transaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionOp {
+    Set { key: String, value: String },
+    Delete { key: String },
+    Incr { key: String },
+}
+
+impl SessionOp {
+    pub fn key(&self) -> &str {
+        match self {
+            SessionOp::Set { key, .. } | SessionOp::Delete { key } | SessionOp::Incr { key } => key,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TxnOp {
     Set { key: String, value: String },
@@ -43,33 +57,24 @@ impl TxnOp {
     }
 }
 
-/// The replicated steps of a two-phase commit. Each is an ordinary Raft log
-/// entry, so every step survives crashes and leader changes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TxnCommand {
-    /// Phase 1 in one partition: lock `ops`' keys and vote.
     Prepare {
         id: String,
-        /// The partition whose log holds the commit/abort decision.
         coordinator: u32,
-        /// Every partition taking part (so a stuck one can be recovered).
         participants: Vec<u32>,
-        /// This partition's share of the writes.
         ops: Vec<TxnOp>,
     },
-    /// The decision, written in the coordinator partition. The first one for
-    /// a transaction wins; later ones are ignored.
-    Decide { id: String, commit: bool },
-    /// Phase 2 in one partition: apply (or discard) the writes, release locks.
-    Finish { id: String, commit: bool },
+    Decide {
+        id: String,
+        commit: bool,
+    },
+    Finish {
+        id: String,
+        commit: bool,
+    },
 }
 
-/// Who is in a Raft group.
-///
-/// * **voters** count toward elections and commitment;
-/// * **learners** receive the log (to catch up) but never vote or count.
-///
-/// Lists are kept sorted and duplicate-free so equal configs encode equally.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ClusterConfig {
     pub voters: Vec<NodeId>,
@@ -95,17 +100,14 @@ impl ClusterConfig {
         self.voters.contains(&id)
     }
 
-    /// Voter or learner.
     pub fn is_member(&self, id: NodeId) -> bool {
         self.is_voter(id) || self.learners.contains(&id)
     }
 
-    /// Votes (or replicas) needed for a majority of the voters.
     pub fn quorum(&self) -> usize {
         self.voters.len() / 2 + 1
     }
 
-    /// Every server that must be sent the log: voters and learners.
     pub fn members(&self) -> Vec<NodeId> {
         let mut all = self.voters.clone();
         all.extend_from_slice(&self.learners);
@@ -114,21 +116,14 @@ impl ClusterConfig {
     }
 }
 
-/// One step of changing a group's membership. Each changes the voter set by
-/// at most one server, so any majority of the old voters overlaps any
-/// majority of the new voters (Raft thesis, section 4.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfigChange {
-    /// Start replicating to a new server without letting it vote.
     AddLearner(NodeId),
-    /// Make a caught-up learner a voter.
     Promote(NodeId),
-    /// Remove a voter or a learner.
     Remove(NodeId),
 }
 
 impl ConfigChange {
-    /// The configuration that results from applying this change to `current`.
     pub fn apply(&self, current: &ClusterConfig) -> Result<ClusterConfig, String> {
         let mut voters = current.voters.clone();
         let mut learners = current.learners.clone();
@@ -199,17 +194,14 @@ pub struct AppendEntriesReply {
     pub success: bool,
 }
 
-/// One chunk of a snapshot streamed from the leader to a lagging follower.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstallSnapshotArgs {
     pub term: u64,
     pub leader_id: NodeId,
     pub last_included_index: u64,
     pub last_included_term: u64,
-    /// Byte offset of `data` within the encoded snapshot.
     pub offset: u64,
     pub data: Vec<u8>,
-    /// True on the final chunk.
     pub done: bool,
 }
 

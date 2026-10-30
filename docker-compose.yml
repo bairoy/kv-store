@@ -1,0 +1,72 @@
+# Four servers with token authentication and TLS.
+#
+#   scripts/gen-certs.sh certs
+#   mkdir -p secrets && openssl rand -hex 24 > secrets/kv_token && chmod 644 secrets/kv_token
+#   docker compose up --build -d
+#
+# A fifth server can be started with `docker compose --profile expand up -d`
+# and added to the cluster with `REBALANCE 1,2,3,4,5`.
+
+x-node: &node
+  build: .
+  restart: unless-stopped
+  networks: [kv]
+  secrets: [kv_token]
+  volumes:
+    - ./certs:/certs:ro
+  environment: &env
+    SHARD_SERVERS: 1=node1,2=node2,3=node3,4=node4,5=node5
+    SHARD_PEER_PORT: "9200"
+    SHARD_CLIENT_PORT: "7200"
+    SHARD_INITIAL: 1,2,3,4
+    KV_AUTH_TOKEN_FILE: /run/secrets/kv_token
+    KV_TLS_CERT: /certs/server.pem
+    KV_TLS_KEY: /certs/server.key
+    KV_TLS_CA: /certs/ca.pem
+
+services:
+  node1:
+    <<: *node
+    hostname: node1
+    command: ["1"]
+    ports: ["127.0.0.1:7201:7200", "127.0.0.1:9301:9300"]
+    volumes: [./certs:/certs:ro, node1:/data]
+  node2:
+    <<: *node
+    hostname: node2
+    command: ["2"]
+    ports: ["127.0.0.1:7202:7200", "127.0.0.1:9302:9300"]
+    volumes: [./certs:/certs:ro, node2:/data]
+  node3:
+    <<: *node
+    hostname: node3
+    command: ["3"]
+    ports: ["127.0.0.1:7203:7200", "127.0.0.1:9303:9300"]
+    volumes: [./certs:/certs:ro, node3:/data]
+  node4:
+    <<: *node
+    hostname: node4
+    command: ["4"]
+    ports: ["127.0.0.1:7204:7200", "127.0.0.1:9304:9300"]
+    volumes: [./certs:/certs:ro, node4:/data]
+  node5:
+    <<: *node
+    hostname: node5
+    profiles: [expand]
+    command: ["5"]
+    ports: ["127.0.0.1:7205:7200", "127.0.0.1:9305:9300"]
+    volumes: [./certs:/certs:ro, node5:/data]
+
+networks:
+  kv: {}
+
+secrets:
+  kv_token:
+    file: ./secrets/kv_token
+
+volumes:
+  node1:
+  node2:
+  node3:
+  node4:
+  node5:

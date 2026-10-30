@@ -1,13 +1,9 @@
 //! V9: one node of a 3-node Raft cluster.
-//!
-//!   cargo run --bin main_raft -- 1      (and 2, 3 in other terminals)
-//!
-//! Node N listens for peers on 910N and for clients on 710N.
-//! Data lives in raft_data/node<N>/.
 
 use std::collections::HashMap;
 use std::io;
 
+use kv_store::net::security::Security;
 use kv_store::raft::node::RaftNode;
 use kv_store::raft::server::{RaftConfig, RaftServer};
 use kv_store::raft::types::NodeId;
@@ -25,6 +21,8 @@ fn client_address(id: NodeId) -> String {
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
+    kv_store::logging::init();
+
     let id: NodeId = std::env::args()
         .nth(1)
         .and_then(|arg| arg.parse().ok())
@@ -54,8 +52,11 @@ async fn main() -> io::Result<()> {
     println!("=================================");
 
     let mut config = RaftConfig::new(peers);
+    config.security = Security::from_env().unwrap_or_else(|error| {
+        eprintln!("security configuration: {error}");
+        std::process::exit(2);
+    });
 
-    // Lower this to watch log compaction and snapshot transfer happen.
     if let Some(threshold) = std::env::var("RAFT_SNAPSHOT_THRESHOLD")
         .ok()
         .and_then(|value| value.parse().ok())
@@ -65,5 +66,18 @@ async fn main() -> io::Result<()> {
 
     let server = RaftServer::new(node, store, config);
 
-    server.run(&peer_address(id), &client_address(id)).await
+    let metrics_address = format!("127.0.0.1:{}", 9400 + id);
+    tokio::spawn(async move {
+        if let Err(error) = kv_store::metrics::serve(&metrics_address).await {
+            tracing::error!("metrics endpoint on {metrics_address} failed: {error}");
+        }
+    });
+
+    let bind_host = std::env::var("KV_BIND_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
+    let bind =
+        |address: String| format!("{bind_host}:{}", address.rsplit(':').next().unwrap_or("0"));
+
+    server
+        .run(&bind(peer_address(id)), &bind(client_address(id)))
+        .await
 }

@@ -5,10 +5,11 @@ pub mod node;
 pub mod persistence;
 pub mod rpc;
 pub mod server;
+pub mod session;
 #[cfg(test)]
 mod sim;
 pub mod snapshot;
-pub mod txn;
 #[cfg(test)]
 mod tests;
+pub mod txn;
 pub mod types;

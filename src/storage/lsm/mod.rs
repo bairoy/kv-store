@@ -27,21 +27,20 @@ impl LsmStore {
     pub fn open(sstable_dir: impl AsRef<Path>, wal_path: impl AsRef<Path>) -> io::Result<Self> {
         let sstable_dir = sstable_dir.as_ref().to_path_buf();
         let wal_path = wal_path.as_ref().to_path_buf();
-        println!("LsmStore::open: creating SSTable directory");
+        tracing::debug!("LsmStore::open: creating SSTable directory");
         fs::create_dir_all(&sstable_dir)?;
 
-        // Recover storage transitions before reading active data.
-        println!("LsmStore::open: recovering compaction");
+        tracing::debug!("LsmStore::open: recovering compaction");
         Self::recover_compaction(&sstable_dir)?;
-        println!("LsmStore::open: recovering snapshot installation");
+        tracing::debug!("LsmStore::open: recovering snapshot installation");
 
         Self::recover_snapshot_install(&sstable_dir, &wal_path)?;
 
-        println!("LsmStore::open: loading SSTables");
+        tracing::debug!("LsmStore::open: loading SSTables");
         let sstables = Self::load_sstables(&sstable_dir)?;
-        println!("LsmStore::open: calculating next SSTable ID");
+        tracing::debug!("LsmStore::open: calculating next SSTable ID");
         let next_sstable_id = next_sstable_id_in(&sstable_dir)?;
-        println!("LsmStore::open: opening WAL");
+        tracing::debug!("LsmStore::open: opening WAL");
 
         let wal_file = OpenOptions::new()
             .create(true)
@@ -71,6 +70,32 @@ impl LsmStore {
         Ok(())
     }
 
+    pub fn write_batch(&mut self, writes: Vec<(String, Option<String>)>) -> io::Result<()> {
+        if writes.is_empty() {
+            return Ok(());
+        }
+
+        let mut record = String::new();
+
+        for (key, value) in &writes {
+            match value {
+                Some(value) => record.push_str(&format!("SET\t{key}\t{value}\n")),
+                None => record.push_str(&format!("DEL\t{key}\n")),
+            }
+        }
+
+        self.append_wal(&record)?;
+
+        for (key, value) in writes {
+            match value {
+                Some(value) => self.memtable.set(key, value),
+                None => self.memtable.delete(key),
+            }
+        }
+
+        Ok(())
+    }
+
     pub fn delete(&mut self, key: String) -> io::Result<Option<String>> {
         let old_value = self.get(&key);
 
@@ -81,23 +106,11 @@ impl LsmStore {
         Ok(old_value)
     }
 
-    /// Read path:
-    ///
-    /// 1. Memtable
-    /// 2. Newest SSTable
-    /// 3. Older SSTable
-    ///
-    /// SSTable lookup itself uses:
-    ///
-    /// Bloom Filter → Sparse Index → bounded scan
     pub fn get(&self, key: &str) -> Option<String> {
-        // Memtable has priority.
         if let Some(value) = self.memtable.get(key) {
             return value.clone();
         }
 
-        // sstables are stored oldest → newest.
-        // Search newest → oldest.
         for table in self.sstables.iter().rev() {
             match table.get(key) {
                 Ok(Some(SstableEntry::Value(value))) => {
@@ -105,21 +118,15 @@ impl LsmStore {
                 }
 
                 Ok(Some(SstableEntry::Tombstone)) => {
-                    // A tombstone is a real answer.
-                    //
-                    // We must NOT continue to older SSTables,
-                    // otherwise an old value could incorrectly
-                    // reappear.
                     return None;
                 }
 
                 Ok(None) => {
-                    // Key is not in this SSTable.
                     continue;
                 }
 
                 Err(error) => {
-                    eprintln!("SSTable read error for {:?}: {}", table.path(), error);
+                    tracing::error!("SSTable read error for {:?}: {}", table.path(), error);
 
                     return None;
                 }
@@ -132,42 +139,34 @@ impl LsmStore {
     pub fn snapshot_entries(&self) -> io::Result<BTreeMap<String, String>> {
         let mut merged: BTreeMap<String, Option<String>> = BTreeMap::new();
 
-        // Older tables are inserted first; newer tables overwrite them.
         for table in &self.sstables {
             for (key, value) in table.read_all()? {
                 merged.insert(key, value);
             }
         }
 
-        // The memtable contains the newest state, including tombstones.
         for (key, value) in self.memtable.iter() {
             merged.insert(key.clone(), value.clone());
         }
 
-        // Snapshots contain live values only.
         Ok(merged
             .into_iter()
             .filter_map(|(key, value)| value.map(|value| (key, value)))
             .collect())
     }
 
-    /// Flush the current memtable to a new immutable SSTable.
     pub fn flush(&mut self) -> io::Result<()> {
         if self.memtable.is_empty() {
             return Ok(());
         }
 
-        // The SSTable is created and fsynced before we truncate
-        // the WAL.
         let path = self.next_sstable_path();
 
         let table = Sstable::create(&path, &self.memtable)?;
 
-        // The SSTable is now durable.
-        //
-        // Only now can the WAL entries represented by this
-        // memtable be discarded.
         self.truncate_wal()?;
+
+        crate::metrics::inc("lsm_flushes_total", &[]);
 
         self.sstables.push(table);
 
@@ -197,7 +196,6 @@ impl LsmStore {
             }
         }
 
-        // Oldest → newest.
         paths.sort();
 
         let mut tables = Vec::new();

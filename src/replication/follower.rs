@@ -73,7 +73,6 @@ impl Follower {
 
         fs::rename(&temp_path, &self.offset_path)?;
 
-        // Make the rename durable on Unix.
         #[cfg(unix)]
         File::open(parent)?.sync_all()?;
 
@@ -112,7 +111,6 @@ impl Follower {
         stream: &mut TcpStream,
     ) -> io::Result<()> {
         if entry.offset <= *last_offset {
-            // Duplicate delivery: acknowledge the offset already applied.
             return Self::send_message(
                 stream,
                 &ReplicationMessage::Ack {
@@ -163,7 +161,6 @@ impl Follower {
             }
         }
 
-        // The LSM write is durable before the offset advances.
         self.persist_offset(entry.offset).map_err(|error| {
             io::Error::new(
                 error.kind(),
@@ -266,9 +263,6 @@ impl Follower {
 
                     let snapshot = receiver.finish(last_included_offset, total_chunks)?;
 
-                    // Installation replaces the entire logical database state.
-                    // Keep the store locked until the installation is complete.
-
                     {
                         let mut store = self.store.lock().await;
                         println!(
@@ -285,9 +279,6 @@ impl Follower {
                             })?;
                     }
 
-                    // The store's snapshot offset is already durable at this point.
-                    // If persisting this separate offset file fails, load_offset()
-                    // can still recover the installed snapshot offset.
                     self.persist_offset(snapshot.last_included_offset)?;
 
                     last_offset = snapshot.last_included_offset;

@@ -27,6 +27,7 @@ impl ReplicationLog {
     pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
         let mut file = OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(path)?;
@@ -40,7 +41,6 @@ impl ReplicationLog {
 
             let mut header = [0u8; 4];
 
-            // Stop recovery when the final header is incomplete.
             if let Err(error) = file.read_exact(&mut header) {
                 if error.kind() == io::ErrorKind::UnexpectedEof {
                     break;
@@ -50,7 +50,6 @@ impl ReplicationLog {
 
             let length = u32::from_be_bytes(header) as usize;
 
-            // Reject invalid record sizes.
             if length == 0 || length > MAX_RECORD_SIZE {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -68,7 +67,6 @@ impl ReplicationLog {
                     )
                 })?;
 
-            // Stop recovery when the final payload is incomplete.
             if record_end > file_len {
                 break;
             }
@@ -78,7 +76,6 @@ impl ReplicationLog {
 
             let entry = decode_entry(&payload)?;
 
-            // Require offsets to start at 1 and remain consecutive.
             let expected_offset = entries.len() as u64 + 1;
 
             if entry.offset != expected_offset {
@@ -92,7 +89,6 @@ impl ReplicationLog {
             position = record_end;
         }
 
-        // Remove an incomplete trailing record.
         if position < file_len {
             file.set_len(position)?;
             file.sync_all()?;
@@ -117,7 +113,6 @@ impl ReplicationLog {
 
         let payload = encode_entry(&entry)?;
 
-        // Enforce the maximum record size.
         if payload.len() > MAX_RECORD_SIZE {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -135,7 +130,6 @@ impl ReplicationLog {
         self.file.write_all(&length.to_be_bytes())?;
         self.file.write_all(&payload)?;
 
-        // Persist the record before publishing it in memory.
         self.file.sync_all()?;
 
         self.entries.push(entry.clone());
@@ -195,7 +189,6 @@ fn decode_entry(bytes: &[u8]) -> io::Result<ReplicationEntry> {
         _ => return Err(invalid_record()),
     };
 
-    // Reject unexpected trailing bytes.
     if cursor != bytes.len() {
         return Err(invalid_record());
     }

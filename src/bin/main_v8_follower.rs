@@ -13,13 +13,11 @@ async fn main() -> io::Result<()> {
 
     println!("Follower: local LSM store opened.");
 
-    // Verify persisted data before moving the store into Follower.
     println!(
         "Snapshot verification: snapshot_test = {:?}",
         store.get("snapshot_test")
     );
 
-    // Follower::new takes ownership of the store.
     let follower = Follower::new(store, "v8_follower.offset");
 
     println!("Follower: starting replication loop...");

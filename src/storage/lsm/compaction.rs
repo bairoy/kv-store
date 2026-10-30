@@ -5,32 +5,16 @@ use super::*;
 pub(super) const COMPACTION_MARKER: &str = "compaction.marker";
 
 impl LsmStore {
-    /// Merge all current SSTables into one new SSTable.
-    ///
-    /// This first implementation performs compaction explicitly.
-    ///
-    /// Newest SSTable wins.
-    ///
-    /// Tombstones are removed because we compact ALL SSTables,
-    /// so there is no older SSTable left that could contain the
-    /// value shadowed by the tombstone.
     pub fn compact(&mut self) -> io::Result<()> {
         if self.sstables.len() < 2 {
             return Ok(());
         }
 
+        crate::metrics::inc("lsm_compactions_total", &[]);
+
         let old_tables = self.sstables.clone();
 
         let new_path = self.next_sstable_path();
-
-        // -------------------------------------------------------
-        // Phase 1:
-        // Write a durable compaction marker BEFORE creating the
-        // replacement SSTable.
-        //
-        // If we crash after this point, recovery knows whether
-        // the new table was successfully installed.
-        // -------------------------------------------------------
 
         let old_names: Vec<String> = old_tables
             .iter()
@@ -55,72 +39,32 @@ impl LsmStore {
 
         self.write_compaction_marker(&new_name, &old_names)?;
 
-        // -------------------------------------------------------
-        // Phase 2:
-        // Merge the SSTables.
-        // -------------------------------------------------------
-
         let mut seen = HashSet::new();
         let mut merged = BTreeMap::new();
 
-        // sstables = oldest → newest
-        //
-        // Therefore iterate backwards.
         for table in old_tables.iter().rev() {
             let entries = table.read_all()?;
 
             for (key, value) in entries {
-                // If we've already encountered this key in a
-                // newer SSTable, the newer version wins.
                 if !seen.insert(key.clone()) {
                     continue;
                 }
 
-                match value {
-                    Some(value) => {
-                        merged.insert(key, Some(value));
-                    }
-
-                    None => {
-                        // Tombstone:
-                        //
-                        // We intentionally do NOT write it into
-                        // the compacted table because ALL older
-                        // SSTables are part of this compaction.
-                    }
+                if let Some(value) = value {
+                    merged.insert(key, Some(value));
                 }
             }
         }
 
-        // -------------------------------------------------------
-        // Phase 3:
-        // Create and fsync the new SSTable.
-        // -------------------------------------------------------
-
         let new_table = Sstable::create_from_entries(&new_path, merged.iter())?;
 
-        // Ensure the directory metadata is durable on Unix.
         sync_directory(&self.sstable_dir)?;
-
-        // -------------------------------------------------------
-        // Phase 4:
-        // Delete old SSTables.
-        //
-        // This happens ONLY after the new SSTable is durable.
-        // -------------------------------------------------------
 
         for table in &old_tables {
             fs::remove_file(table.path())?;
         }
 
         sync_directory(&self.sstable_dir)?;
-
-        // -------------------------------------------------------
-        // Phase 5:
-        // Remove the marker.
-        //
-        // Compaction is now complete.
-        // -------------------------------------------------------
 
         let marker_path = self.marker_path();
 
@@ -169,15 +113,6 @@ impl LsmStore {
         Ok(())
     }
 
-    /// Recover a compaction interrupted by a crash.
-    ///
-    /// Cases:
-    ///
-    /// 1. Marker exists, new SSTable doesn't exist:
-    ///    compaction never completed → keep old tables.
-    ///
-    /// 2. Marker exists, new SSTable exists:
-    ///    new table is durable → finish deleting old tables.
     pub(super) fn recover_compaction(dir: &Path) -> io::Result<()> {
         let marker_path = dir.join(COMPACTION_MARKER);
 
@@ -224,9 +159,6 @@ impl LsmStore {
         let new_path = dir.join(&new_name);
 
         if new_path.exists() {
-            // New SSTable is durable.
-            //
-            // Finish deleting old SSTables.
             for old_name in old_names {
                 let old_path = dir.join(old_name);
 
@@ -236,10 +168,6 @@ impl LsmStore {
             }
         }
 
-        // If new table doesn't exist, the compaction never
-        // reached the durable-output stage. Leave old tables.
-        //
-        // In either case the marker is no longer needed.
         fs::remove_file(marker_path)?;
 
         sync_directory(dir)?;

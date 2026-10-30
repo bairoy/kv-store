@@ -17,10 +17,6 @@ pub struct ShardedStore {
 }
 
 impl ShardedStore {
-    // ---------------------------------------------------------
-    // OPEN
-    // ---------------------------------------------------------
-
     pub fn open(snapshot_path: &str, wal_path: &str) -> io::Result<Self> {
         Self::open_with_shards(snapshot_path, wal_path, DEFAULT_SHARD_COUNT)
     }
@@ -54,16 +50,11 @@ impl ShardedStore {
             )),
         };
 
-        // Recover state.
         store.load_snapshot(snapshot_path)?;
         store.replay_wal(wal_path)?;
 
         Ok(store)
     }
-
-    // ---------------------------------------------------------
-    // SHARD SELECTION
-    // ---------------------------------------------------------
 
     fn shard_index(&self, key: &str) -> usize {
         let mut hasher = DefaultHasher::new();
@@ -72,10 +63,6 @@ impl ShardedStore {
 
         (hasher.finish() as usize) % self.shards.len()
     }
-
-    // ---------------------------------------------------------
-    // SNAPSHOT RECOVERY
-    // ---------------------------------------------------------
 
     fn load_snapshot(&self, snapshot_path: &str) -> io::Result<()> {
         match File::open(snapshot_path) {
@@ -97,9 +84,7 @@ impl ShardedStore {
                 }
             }
 
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                // No snapshot yet.
-            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
 
             Err(error) => return Err(error),
         }
@@ -139,9 +124,7 @@ impl ShardedStore {
                 }
             }
 
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                // No WAL yet.
-            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
 
             Err(error) => return Err(error),
         }
@@ -149,14 +132,9 @@ impl ShardedStore {
         Ok(())
     }
 
-    // ---------------------------------------------------------
-    // SET
-    // ---------------------------------------------------------
-
     pub fn set(&self, key: String, value: String) -> io::Result<()> {
         let entry = LogEntry::Set(key.clone(), value.clone());
 
-        // WAL must become durable first.
         {
             let mut wal = self.wal.lock().unwrap();
 
@@ -167,7 +145,6 @@ impl ShardedStore {
             wal.get_ref().sync_all()?;
         }
 
-        // Then update only the required shard.
         let index = self.shard_index(&key);
 
         let mut shard = self.shards[index].map.lock().unwrap();
@@ -177,10 +154,6 @@ impl ShardedStore {
         Ok(())
     }
 
-    // ---------------------------------------------------------
-    // GET
-    // ---------------------------------------------------------
-
     pub fn get(&self, key: &str) -> Option<String> {
         let index = self.shard_index(key);
 
@@ -189,14 +162,9 @@ impl ShardedStore {
         shard.get(key).cloned()
     }
 
-    // ---------------------------------------------------------
-    // DELETE
-    // ---------------------------------------------------------
-
     pub fn delete(&self, key: &str) -> io::Result<Option<String>> {
         let entry = LogEntry::Delete(key.to_string());
 
-        // WAL must become durable first.
         {
             let mut wal = self.wal.lock().unwrap();
 
@@ -214,12 +182,7 @@ impl ShardedStore {
         Ok(shard.remove(key))
     }
 
-    // ---------------------------------------------------------
-    // SNAPSHOT
-    // ---------------------------------------------------------
-
     pub fn snapshot(&self, snapshot_path: &str, wal_path: &str) -> io::Result<()> {
-        // First make the WAL durable.
         {
             let mut wal = self.wal.lock().unwrap();
 
@@ -232,7 +195,6 @@ impl ShardedStore {
         {
             let mut file = File::create(&temp_path)?;
 
-            // Write every shard into the snapshot.
             for shard in &self.shards {
                 let shard = shard.map.lock().unwrap();
 
@@ -244,10 +206,8 @@ impl ShardedStore {
             file.sync_all()?;
         }
 
-        // Atomically install snapshot.
         std::fs::rename(&temp_path, snapshot_path)?;
 
-        // Snapshot is durable, so truncate WAL.
         let new_wal = OpenOptions::new()
             .create(true)
             .write(true)
@@ -261,10 +221,6 @@ impl ShardedStore {
         Ok(())
     }
 }
-
-// =============================================================
-// WAL ENTRY
-// =============================================================
 
 pub enum LogEntry {
     Set(String, String),
@@ -284,10 +240,6 @@ impl LogEntry {
         }
     }
 }
-
-// =============================================================
-// TESTS
-// =============================================================
 
 #[cfg(test)]
 mod tests {
@@ -527,7 +479,6 @@ mod tests {
             handle.join().unwrap();
         }
 
-        // Verify that all threads' writes survived.
         for thread_id in 0..16 {
             for i in 0..100 {
                 let key = format!("key-{thread_id}-{i}");

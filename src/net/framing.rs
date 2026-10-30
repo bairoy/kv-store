@@ -6,6 +6,12 @@ const MAX_FRAME_SIZE: usize = 1024 * 1024;
 pub struct FrameDecoder {
     buffer: Vec<u8>,
 }
+impl Default for FrameDecoder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl FrameDecoder {
     pub fn new() -> Self {
         Self { buffer: Vec::new() }
@@ -42,7 +48,7 @@ impl FrameDecoder {
         if self.buffer.len() < frame_size {
             return Ok(None);
         }
-        let payload = self.buffer[HEADER_SIZE..frame_size].to_vec(); // slice borrows , to_vec creates copy , so that payload has owns its own data 
+        let payload = self.buffer[HEADER_SIZE..frame_size].to_vec();
         self.buffer.drain(..frame_size);
         Ok(Some(payload))
     }
@@ -108,7 +114,6 @@ mod tests {
         let payload = b"GET name";
         let frame = encode_frame(payload).unwrap();
 
-        // Send only part of the frame.
         let partial_frame = &frame[..frame.len() - 2];
 
         let mut decoder = FrameDecoder::new();
@@ -129,20 +134,16 @@ mod tests {
 
         let mut decoder = FrameDecoder::new();
 
-        // First TCP read.
         let mut first_stream = Cursor::new(first_part);
 
         decoder.read_from(&mut first_stream).unwrap();
 
-        // Frame is incomplete.
         assert_eq!(decoder.next_frame().unwrap(), None);
 
-        // Second TCP read.
         let mut second_stream = Cursor::new(second_part);
 
         decoder.read_from(&mut second_stream).unwrap();
 
-        // Now the complete frame should be available.
         assert_eq!(decoder.next_frame().unwrap(), Some(payload.to_vec()));
     }
 
@@ -190,13 +191,11 @@ mod tests {
 
         decoder.read_from(&mut stream).unwrap();
 
-        // First frame is complete.
         assert_eq!(
             decoder.next_frame().unwrap(),
             Some(b"SET name Baiju".to_vec())
         );
 
-        // Second frame is incomplete.
         assert_eq!(decoder.next_frame().unwrap(), None);
     }
 

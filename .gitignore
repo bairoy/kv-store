@@ -2,7 +2,7 @@
 .DS_Store
 .env
 
-# runtime data produced by servers/tests
+# runtime data produced by servers, tests and the chaos tool
 *.log
 *.offset
 *.db
@@ -10,8 +10,15 @@
 *_sstables/
 raft_data/
 shard_data/
+chaos_data/
 
-# reference material
+# keys, certificates and secrets
+certs/
+secrets/
+*.pem
+*.key
+
+# reference material and local notes (only README.md is kept)
 *.pdf
-# documentation notes (local only)
 *.md
+!README.md

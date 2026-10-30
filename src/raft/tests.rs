@@ -261,7 +261,6 @@ fn heartbeat_does_not_commit_unverified_stale_tail() {
         .append(entry(1, "stale", "2"))
         .expect("append stale entry 2");
 
-    // The leader only vouches for index 1, even though leader_commit is 2.
     let reply = node
         .handle_append_entries(AppendEntriesArgs {
             term: 2,
@@ -319,7 +318,6 @@ fn duplicate_append_entries_leaves_log_unchanged() {
 
     assert!(node.handle_append_entries(args.clone()).unwrap().success);
 
-    // A delayed duplicate carrying only the first entry must not truncate.
     let stale = AppendEntriesArgs {
         entries: vec![entry(1, "a", "1")],
         ..args.clone()
@@ -373,7 +371,6 @@ fn leader_does_not_commit_old_term_entry_by_counting_replicas() {
         .append(entry(1, "old", "1"))
         .expect("append old entry");
 
-    // Move to term 1 via a vote for node 2, then run for term 2.
     node.handle_vote_request(RequestVoteArgs {
         term: 1,
         candidate_id: 2,
@@ -395,11 +392,9 @@ fn leader_does_not_commit_old_term_entry_by_counting_replicas() {
     .expect("record vote response");
     assert_eq!(node.role, Role::Leader);
 
-    // The old-term entry is on a majority, but must not be committed alone.
     node.advance_commit_index(&HashMap::from([(2, 1), (3, 1)]));
     assert_eq!(node.commit_index, 0);
 
-    // A current-term entry on a majority commits it and everything before it.
     let index = node
         .append_client_command(set("new", "2"))
         .expect("leader accepts command");
@@ -436,7 +431,6 @@ fn log_survives_restart_and_discards_torn_tail() {
         log.append(entry(2, "b", "2")).expect("append 2");
     }
 
-    // Simulate a crash mid-append: a header promising more bytes than exist.
     std::fs::OpenOptions::new()
         .append(true)
         .open(&path)
@@ -450,17 +444,12 @@ fn log_survives_restart_and_discards_torn_tail() {
     assert_eq!(log.last_term(), 2);
     assert_eq!(log.entry_at(2), Some(&entry(2, "b", "2")));
 
-    // The torn bytes are gone, so a new append lands cleanly at index 3.
     assert_eq!(log.append(entry(2, "c", "3")).expect("append 3"), 3);
     drop(log);
 
     let log = RaftLog::open(&path).expect("reopen Raft log again");
     assert_eq!(log.last_index(), 3);
 }
-
-// ---------------------------------------------------------------------------
-// In-process cluster helpers: messages are delivered by direct method calls.
-// ---------------------------------------------------------------------------
 
 fn cluster(name: &str) -> Vec<RaftNode> {
     members()
@@ -472,7 +461,6 @@ fn cluster(name: &str) -> Vec<RaftNode> {
         .collect()
 }
 
-/// `candidate` starts an election and asks only the nodes in `voters`.
 fn elect(nodes: &mut [RaftNode], candidate: usize, voters: &[usize]) {
     let args = nodes[candidate].start_election().expect("start election");
 
@@ -488,7 +476,6 @@ fn elect(nodes: &mut [RaftNode], candidate: usize, voters: &[usize]) {
     }
 }
 
-/// One AppendEntries round trip from leader `from` to follower `to`.
 fn deliver(nodes: &mut [RaftNode], from: usize, to: usize) -> bool {
     let to_id = nodes[to].id;
     let args = nodes[from]
@@ -515,7 +502,6 @@ fn leader_replicates_commits_and_followers_learn_the_commit() {
     assert_eq!(nodes[0].role, Role::Leader);
     assert_eq!(nodes[0].leader_id, Some(1));
 
-    // The new leader's no-op is entry 1; the client write is entry 2.
     assert_eq!(
         nodes[0].log.entry_at(1).map(|e| &e.command),
         Some(&Command::Noop)
@@ -532,7 +518,6 @@ fn leader_replicates_commits_and_followers_learn_the_commit() {
     );
     assert_eq!(nodes[0].entries_to_apply().len(), 2);
 
-    // The follower only learns the commit index from the next message.
     assert_eq!(nodes[1].commit_index, 0);
     assert!(deliver(&mut nodes, 0, 1));
     assert_eq!(nodes[1].commit_index, 2);
@@ -543,7 +528,6 @@ fn leader_replicates_commits_and_followers_learn_the_commit() {
     assert!(nodes[0].entries_to_apply().is_empty());
     assert_eq!(nodes[0].last_applied, 2);
 
-    // Applying never runs ahead of the commit index.
     nodes[2].mark_applied(99);
     assert_eq!(nodes[2].last_applied, 0);
 }
@@ -552,7 +536,6 @@ fn leader_replicates_commits_and_followers_learn_the_commit() {
 fn leader_backs_up_and_repairs_a_divergent_follower() {
     let mut nodes = cluster("repair");
 
-    // Node 2 holds stale term-1 entries from a leader that never committed them.
     nodes[1]
         .log
         .append(entry(1, "b", "stale"))
@@ -562,7 +545,6 @@ fn leader_backs_up_and_repairs_a_divergent_follower() {
         .append(entry(1, "c", "stale"))
         .expect("stale 2");
 
-    // Node 1 has a term-2 entry and wins term 2 with node 3's vote.
     nodes[0]
         .log
         .append(entry(2, "a", "1"))
@@ -572,9 +554,7 @@ fn leader_backs_up_and_repairs_a_divergent_follower() {
     assert_eq!(nodes[0].role, Role::Leader);
     assert_eq!(nodes[0].current_term, 2);
 
-    // First attempt mismatches at prev_log_index 1; the leader backs up.
     assert!(!deliver(&mut nodes, 0, 1));
-    // Second attempt overwrites the divergent tail.
     assert!(deliver(&mut nodes, 0, 1));
 
     assert_eq!(nodes[1].log.last_index(), 2);
@@ -591,7 +571,6 @@ fn leader_backs_up_and_repairs_a_divergent_follower() {
 fn committed_entry_survives_leader_change() {
     let mut nodes = cluster("failover");
 
-    // Node 1 leads, commits "x" with node 2, then "crashes" before node 3 sees it.
     elect(&mut nodes, 0, &[1]);
     nodes[0]
         .append_client_command(set("x", "10"))
@@ -599,11 +578,9 @@ fn committed_entry_survives_leader_change() {
     assert!(deliver(&mut nodes, 0, 1));
     assert_eq!(nodes[0].commit_index, 2);
 
-    // Node 3 is behind: node 2 must refuse to vote for it.
     elect(&mut nodes, 2, &[1]);
     assert_ne!(nodes[2].role, Role::Leader);
 
-    // Node 2 has the committed entry, so node 3 votes for it.
     elect(&mut nodes, 1, &[2]);
     assert_eq!(nodes[1].role, Role::Leader);
     assert_eq!(
@@ -611,7 +588,6 @@ fn committed_entry_survives_leader_change() {
         Some(&set("x", "10"))
     );
 
-    // The new leader brings node 3 up to date.
     while nodes[2].log.last_index() < nodes[1].log.last_index() {
         deliver(&mut nodes, 1, 2);
     }
@@ -628,7 +604,6 @@ fn stale_leader_steps_down_when_a_follower_reports_a_higher_term() {
     elect(&mut nodes, 0, &[1]);
     assert_eq!(nodes[0].role, Role::Leader);
 
-    // Node 2 moved on to a later term while node 1 was partitioned away.
     nodes[1]
         .handle_vote_request(RequestVoteArgs {
             term: 5,
@@ -657,10 +632,6 @@ fn candidate_forgets_the_previous_leader() {
 
     assert_eq!(nodes[1].leader_id, None);
 }
-
-// ---------------------------------------------------------------------------
-// Log compaction and snapshots
-// ---------------------------------------------------------------------------
 
 fn log_with_terms(name: &str, terms: &[u64]) -> (RaftLog, PathBuf) {
     let path = test_log_path(name);
@@ -706,7 +677,6 @@ fn compaction_keeps_the_suffix_and_survives_restart() {
 
 #[test]
 fn compacting_past_the_end_or_over_a_conflict_discards_the_whole_log() {
-    // Snapshot ahead of the log.
     let (mut log, path) = log_with_terms("compact_ahead", &[1, 1, 1]);
     log.compact_to(10, 4, ClusterConfig::default())
         .expect("compact");
@@ -720,7 +690,6 @@ fn compacting_past_the_end_or_over_a_conflict_discards_the_whole_log() {
     assert_eq!(log.base_index(), 10);
     assert_eq!(log.last_index(), 11);
 
-    // Snapshot disagrees with the entry at its index.
     let (mut log, _) = log_with_terms("compact_conflict", &[1, 1, 1, 1]);
     log.compact_to(2, 5, ClusterConfig::default())
         .expect("compact");
@@ -738,7 +707,6 @@ fn crash_between_writing_the_base_and_rewriting_the_log_is_recovered() {
         .expect("compact");
     drop(log);
 
-    // Simulate the crash: the new base is durable, the old log file is back.
     std::fs::write(&path, before).expect("restore old log file");
 
     let log = RaftLog::open(&path).expect("reopen after simulated crash");
@@ -763,12 +731,10 @@ fn leader_batches_overlapping_the_snapshot_are_trimmed() {
         entry(1, "k6", "v"),
     ];
 
-    // prev_log_index 1 is inside the snapshot; only entry 6 is new.
     assert!(log.append_from_leader(1, 1, &batch, 3).expect("append"));
     assert_eq!(log.last_index(), 6);
     assert_eq!(log.entry_at(4), Some(&entry(1, "k4", "v")));
 
-    // A batch lying entirely inside the snapshot is a harmless no-op.
     assert!(
         log.append_from_leader(0, 0, &batch[..2], 3)
             .expect("append")
@@ -830,7 +796,6 @@ fn compacted_node_resumes_from_its_snapshot_and_needs_the_snapshot_file() {
 fn lagging_follower_is_caught_up_with_a_snapshot() {
     let mut nodes = cluster("snapshot_catch_up");
 
-    // Node 1 leads and commits five client writes together with node 2.
     elect(&mut nodes, 0, &[1]);
     for i in 0..5 {
         nodes[0]
@@ -840,16 +805,13 @@ fn lagging_follower_is_caught_up_with_a_snapshot() {
     assert!(deliver(&mut nodes, 0, 1));
     assert_eq!(nodes[0].commit_index, 6);
 
-    // The leader snapshots and drops its whole log.
     nodes[0].mark_applied(6);
     nodes[0].compact_log_to(6, 1).expect("compact leader log");
     assert_eq!(nodes[0].log.first_index(), 7);
 
-    // Node 3 never saw anything, so it needs entries that no longer exist.
     assert!(nodes[0].needs_snapshot(3));
     assert!(!nodes[0].needs_snapshot(2));
 
-    // Follower side of InstallSnapshot.
     assert!(nodes[2].observe_leader(1, 1).expect("current term"));
     assert!(!nodes[2].observe_leader(0, 1).expect("stale term"));
     assert!(nodes[2].should_install_snapshot(6));
@@ -863,7 +825,6 @@ fn lagging_follower_is_caught_up_with_a_snapshot() {
     assert_eq!(nodes[2].log.term_at(6), Some(1));
     assert!(!nodes[2].should_install_snapshot(6), "already have it");
 
-    // Leader side: the acknowledgement moves node 3 onto normal replication.
     nodes[0]
         .handle_install_snapshot_reply(3, 6, 1, 1)
         .expect("handle snapshot reply");
@@ -880,11 +841,6 @@ fn lagging_follower_is_caught_up_with_a_snapshot() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Membership changes
-// ---------------------------------------------------------------------------
-
-/// Three voters (ids 1-3) plus a joining server (id 4) that knows nothing.
 fn cluster_with_joiner(name: &str) -> Vec<RaftNode> {
     let mut nodes = cluster(name);
 
@@ -968,12 +924,10 @@ fn log_reports_the_latest_config_and_keeps_it_across_compaction() {
     );
     assert_eq!(log.config_as_of(3), (2, changed.clone()));
 
-    // Dropping the config entry by compaction must not forget it.
     log.compact_to(3, 1, changed.clone()).expect("compact");
     assert_eq!(log.latest_config(), (0, changed.clone()));
     drop(log);
 
-    // ...even though a restart is given a different bootstrap config.
     let log = RaftLog::open_with_config(&path, bootstrap).expect("reopen");
     assert_eq!(log.base_config(), &changed);
     assert_eq!(log.latest_config().1, changed);
@@ -984,7 +938,7 @@ fn learner_receives_the_log_but_never_counts_toward_commit() {
     let mut nodes = cluster_with_joiner("learner_commit");
 
     elect(&mut nodes, 0, &[1]);
-    assert!(deliver(&mut nodes, 0, 1)); // commits the leader's no-op
+    assert!(deliver(&mut nodes, 0, 1));
 
     let index = nodes[0]
         .propose_config_change(ConfigChange::AddLearner(4))
@@ -996,12 +950,10 @@ fn learner_receives_the_log_but_never_counts_toward_commit() {
     );
     assert_eq!(nodes[0].quorum_size(), 2);
 
-    // The two voters commit it; the learner has acknowledged nothing.
     assert!(deliver(&mut nodes, 0, 1));
     assert_eq!(nodes[0].commit_index, index);
     assert_eq!(nodes[0].match_index_of(4), Some(0));
 
-    // The learner catches up from the beginning and learns the config.
     assert!(!nodes[3].is_voter());
     while nodes[3].log.last_index() < nodes[0].log.last_index() {
         assert!(deliver(&mut nodes, 0, 3));
@@ -1009,8 +961,6 @@ fn learner_receives_the_log_but_never_counts_toward_commit() {
     assert_eq!(nodes[3].config(), nodes[0].config());
     assert!(!nodes[3].is_voter(), "a learner is not a voter");
 
-    // A new entry that exists only on the leader and the learner is on 2
-    // servers, but only 1 of them is a voter: it must NOT commit.
     let index = nodes[0]
         .append_client_command(set("only", "learner"))
         .expect("leader accepts command");
@@ -1021,7 +971,6 @@ fn learner_receives_the_log_but_never_counts_toward_commit() {
         "a learner's copy must not count toward the majority"
     );
 
-    // One more voter makes it a real majority.
     assert!(deliver(&mut nodes, 0, 1));
     assert_eq!(nodes[0].commit_index, index);
 }
@@ -1032,7 +981,6 @@ fn one_change_at_a_time_and_only_after_committing_in_the_leaders_term() {
 
     elect(&mut nodes, 0, &[1]);
 
-    // The new leader's no-op is not committed yet.
     assert!(
         nodes[0]
             .propose_config_change(ConfigChange::AddLearner(4))
@@ -1053,7 +1001,7 @@ fn one_change_at_a_time_and_only_after_committing_in_the_leaders_term() {
         "the first change has not committed yet"
     );
 
-    assert!(deliver(&mut nodes, 0, 1)); // commits it
+    assert!(deliver(&mut nodes, 0, 1));
     nodes[0]
         .propose_config_change(ConfigChange::Remove(3))
         .expect("allowed once the previous change committed");
@@ -1080,12 +1028,10 @@ fn promoting_a_learner_raises_the_quorum_to_three_of_four() {
     assert_eq!(voters_of(&nodes[0]), vec![1, 2, 3, 4]);
     assert_eq!(nodes[0].quorum_size(), 3);
 
-    // Leader + one follower is only 2 of 4: not committed.
     let promote_index = nodes[0].log.last_index();
     assert!(deliver(&mut nodes, 0, 1));
     assert!(nodes[0].commit_index < promote_index);
 
-    // A third copy commits it.
     assert!(deliver(&mut nodes, 0, 3));
     assert_eq!(nodes[0].commit_index, promote_index);
 }
@@ -1094,7 +1040,6 @@ fn promoting_a_learner_raises_the_quorum_to_three_of_four() {
 fn a_server_that_knows_no_config_grants_votes_instead_of_vetoing() {
     let mut nodes = cluster_with_joiner("empty_grants");
 
-    // Server 4 has never heard from a leader, so it knows no voters at all.
     assert!(nodes[3].config().voters.is_empty());
 
     let reply = nodes[3]
@@ -1117,11 +1062,8 @@ fn a_server_that_knows_no_config_grants_votes_instead_of_vetoing() {
 fn learners_and_removed_servers_cannot_campaign_or_disturb_voters() {
     let mut nodes = cluster_with_joiner("no_campaign");
 
-    // A joining server has no config: it must not start elections.
     assert!(nodes[3].start_election().is_err());
 
-    // A voter ignores vote requests from a server outside its config, and
-    // does not even adopt its (higher) term.
     let before = nodes[0].current_term;
     let reply = nodes[0]
         .handle_vote_request(RequestVoteArgs {
@@ -1153,13 +1095,11 @@ fn a_leader_that_removes_itself_steps_down_only_after_the_change_commits() {
         "still leading until it commits"
     );
 
-    // The leader no longer counts itself: one follower is 1 of 2, not enough.
     let index = nodes[0].log.last_index();
     assert!(deliver(&mut nodes, 0, 1));
     assert!(nodes[0].commit_index < index);
     assert_eq!(nodes[0].role, Role::Leader);
 
-    // Both remaining voters have it: committed, so the old leader steps down.
     assert!(deliver(&mut nodes, 0, 2));
     assert_eq!(nodes[0].commit_index, index);
     assert_eq!(nodes[0].role, Role::Follower);
@@ -1175,7 +1115,6 @@ fn a_follower_drops_an_uncommitted_config_when_its_entry_is_overwritten() {
         learners: vec![4],
     };
 
-    // Leader 1 (term 1) sends a no-op and a config change.
     let reply = node
         .handle_append_entries(AppendEntriesArgs {
             term: 1,
@@ -1199,7 +1138,6 @@ fn a_follower_drops_an_uncommitted_config_when_its_entry_is_overwritten() {
     assert_eq!(node.config(), &changed, "adopted as soon as it is appended");
     assert!(node.has_pending_config());
 
-    // Leader 3 (term 2) never saw that entry and overwrites index 2.
     let reply = node
         .handle_append_entries(AppendEntriesArgs {
             term: 2,
@@ -1231,7 +1169,6 @@ fn a_snapshot_carries_the_config_to_a_joining_server_and_restarts_keep_it() {
         .expect("add learner");
     assert!(deliver(&mut nodes, 0, 1));
 
-    // The leader snapshots everything, dropping the config entry with it.
     let applied = nodes[0].commit_index;
     nodes[0].mark_applied(applied);
     let term = nodes[0].log.term_at(applied).expect("term");
@@ -1241,7 +1178,6 @@ fn a_snapshot_carries_the_config_to_a_joining_server_and_restarts_keep_it() {
     nodes[0].compact_log_to(applied, term).expect("compact");
     assert!(nodes[0].needs_snapshot(4));
 
-    // The joiner installs that snapshot and learns the membership from it.
     assert!(nodes[3].observe_leader(1, 1).expect("observe leader"));
     nodes[3]
         .finish_snapshot_install(applied, term, config.clone())

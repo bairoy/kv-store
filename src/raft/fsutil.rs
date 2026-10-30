@@ -4,8 +4,6 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
-/// Replace `path` with `bytes` so readers see the old or the new content,
-/// never a partial write (temp file, fsync, rename, fsync directory).
 pub fn write_file_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let temp = temp_path_for(path);
 

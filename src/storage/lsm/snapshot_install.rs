@@ -12,7 +12,6 @@ impl LsmStore {
         entries: &BTreeMap<String, String>,
         last_included_offset: u64,
     ) -> io::Result<()> {
-        // Choose a filename that does not already exist.
         let final_path = loop {
             let path = self.next_sstable_path();
 
@@ -23,7 +22,7 @@ impl LsmStore {
             self.next_sstable_id += 1;
         };
 
-        let final_name = final_path
+        let _final_name = final_path
             .file_name()
             .and_then(|name| name.to_str())
             .ok_or_else(|| {
@@ -34,8 +33,6 @@ impl LsmStore {
             })?
             .to_string();
 
-        // The staging filename does not end in ".db", so the ordinary
-        // SSTable loader cannot mistake it for an active table.
         let staged_path = self
             .sstable_dir
             .join(format!("snapshot-staged-{}.staged", std::process::id()));
@@ -46,12 +43,9 @@ impl LsmStore {
             table_entries.insert(key.clone(), Some(value.clone()));
         }
 
-        // Build and fsync the replacement before recording the transition.
         Sstable::create_from_entries(&staged_path, table_entries.iter())?;
         sync_directory(&self.sstable_dir)?;
 
-        // Once this marker is durable, startup recovery must finish
-        // this installation rather than resume with the old database.
         Self::write_snapshot_install_marker(
             &self.sstable_dir,
             &staged_path,
@@ -59,17 +53,13 @@ impl LsmStore {
             last_included_offset,
         )?;
 
-        // Use the same recovery procedure during live installation and
-        // startup. This keeps both paths consistent.
         Self::recover_snapshot_install(&self.sstable_dir, &self.wal_path)?;
 
-        // Replace the in-memory view with the installed generation.
         self.sstables = Self::load_sstables(&self.sstable_dir)?;
         self.memtable = Memtable::new();
 
         self.next_sstable_id = next_sstable_id_in(&self.sstable_dir)?;
 
-        // Reopen the WAL so future writes continue appending normally.
         let wal_file = OpenOptions::new()
             .create(true)
             .read(true)
@@ -218,15 +208,12 @@ impl LsmStore {
             )
         })?;
 
-        // Do not allow marker contents to escape the SSTable directory.
         validate_basename(&staged_name)?;
         validate_basename(&final_name)?;
 
         let staged_path = dir.join(&staged_name);
         let final_path = dir.join(&final_name);
 
-        // Complete activation. The staged file was made durable before
-        // the marker was written, so at least one valid candidate must exist.
         if !final_path.exists() {
             if !staged_path.exists() {
                 return Err(io::Error::new(
@@ -235,26 +222,20 @@ impl LsmStore {
                 ));
             }
 
-            // Validate the staged table before activating it.
             drop(Sstable::open(staged_path.clone())?);
 
             fs::rename(&staged_path, &final_path)?;
             sync_directory(dir)?;
         } else {
-            // If activation already completed, a leftover staging file is
-            // no longer needed.
             if staged_path.exists() {
                 fs::remove_file(&staged_path)?;
             }
         }
 
-        // Validate the authoritative replacement before destroying old data.
         drop(Sstable::open(final_path.clone())?);
 
-        // Old WAL records must not be replayed over the snapshot.
         truncate_wal_file(wal_path)?;
 
-        // Remove all old SSTables except the selected replacement.
         for entry in fs::read_dir(dir)? {
             let entry = entry?;
             let path = entry.path();
@@ -268,10 +249,8 @@ impl LsmStore {
 
         sync_directory(dir)?;
 
-        // Persist the snapshot base offset before removing the marker.
         persist_snapshot_offset(dir, offset)?;
 
-        // The transition is complete. Removing the marker is the final step.
         if marker_path.exists() {
             fs::remove_file(&marker_path)?;
         }

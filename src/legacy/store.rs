@@ -11,7 +11,6 @@ impl Store {
     pub fn open(snapshot_path: &str, wal_path: &str) -> io::Result<Self> {
         let mut map = HashMap::new();
 
-        // Load snapshot first.
         match File::open(snapshot_path) {
             Ok(file) => {
                 let reader = BufReader::new(file);
@@ -31,7 +30,6 @@ impl Store {
             Err(error) => return Err(error),
         }
 
-        // Replay WAL on top of the snapshot.
         match File::open(wal_path) {
             Ok(file) => {
                 let reader = BufReader::new(file);
@@ -86,10 +84,8 @@ impl Store {
             file.sync_all()?;
         }
 
-        // Atomically install the new snapshot.
         std::fs::rename(&temp_path, snapshot_path)?;
 
-        // Snapshot is durable, so the old WAL can be removed.
         let new_wal = OpenOptions::new()
             .create(true)
             .write(true)
@@ -347,7 +343,6 @@ mod tests {
                 file.sync_all().unwrap();
             }
 
-            // Simulate crash after snapshot rename.
             std::fs::rename(&temp_path, snapshot).unwrap();
         }
 

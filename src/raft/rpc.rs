@@ -1,7 +1,4 @@
 //! Raft RPC messages and their wire encoding.
-//!
-//! One message is one frame payload (see `net::framing`): a tag byte followed
-//! by the fields of that message.
 
 use std::io;
 
@@ -21,7 +18,6 @@ const APPEND_ENTRIES_REPLY: u8 = 4;
 const INSTALL_SNAPSHOT: u8 = 5;
 const INSTALL_SNAPSHOT_REPLY: u8 = 6;
 
-/// Upper bound on entries preallocated while decoding untrusted input.
 const MAX_PREALLOCATED_ENTRIES: usize = 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -152,8 +148,6 @@ pub fn decode_message(bytes: &[u8]) -> io::Result<RaftMessage> {
     Ok(message)
 }
 
-/// Prefix a message with the id of the Raft group it belongs to, so several
-/// groups (one per partition) can share a single TCP port: `[group u32][message]`.
 pub fn encode_envelope(group_id: u32, message: &RaftMessage) -> io::Result<Vec<u8>> {
     let mut out = Vec::new();
 
@@ -302,9 +296,7 @@ mod tests {
     fn malformed_messages_are_rejected() {
         assert!(decode_message(&[]).is_err());
         assert!(decode_message(&[99]).is_err());
-        // truncated RequestVote
         assert!(decode_message(&[REQUEST_VOTE, 0, 0, 0]).is_err());
-        // invalid boolean
         let mut bytes = encode_message(&RaftMessage::AppendEntriesReply(AppendEntriesReply {
             term: 1,
             success: true,
@@ -312,7 +304,6 @@ mod tests {
         .unwrap();
         *bytes.last_mut().unwrap() = 7;
         assert!(decode_message(&bytes).is_err());
-        // trailing garbage
         let mut bytes = encode_message(&RaftMessage::RequestVoteReply(RequestVoteReply {
             term: 1,
             vote_granted: false,
@@ -320,13 +311,11 @@ mod tests {
         .unwrap();
         bytes.push(0);
         assert!(decode_message(&bytes).is_err());
-        // snapshot chunk claiming more bytes than the payload holds
         let mut bytes = vec![INSTALL_SNAPSHOT];
         bytes.extend_from_slice(&[0; 40]);
         bytes.push(0);
         bytes.extend_from_slice(&u32::MAX.to_be_bytes());
         assert!(decode_message(&bytes).is_err());
-        // entry count larger than the payload
         let mut bytes = vec![APPEND_ENTRIES];
         bytes.extend_from_slice(&[0; 40]);
         bytes.extend_from_slice(&u32::MAX.to_be_bytes());

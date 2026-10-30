@@ -1,24 +1,4 @@
 //! Deterministic fault-injection harness for Raft (test-only).
-//!
-//! A `SimCluster` runs real `RaftNode`s (with real on-disk logs) but replaces
-//! the network and timers with direct calls driven by a seeded RNG. It can
-//! crash and restart nodes, partition the network and drop messages, and after
-//! every step it checks the safety properties from the Raft paper:
-//!
-//! * election safety      - at most one leader per term
-//! * log matching         - equal (index, term) implies equal prefix
-//! * state machine safety - no two different entries commit at one index
-//! * leader completeness  - a leader holds every entry committed in earlier
-//!   terms
-//! * monotonicity         - terms and commit indexes never go backwards
-//! * membership           - every committed config differs from the previous
-//!   one by at most one server, and a node's cached config always equals the
-//!   latest config entry in its log
-//!
-//! `SimCluster::elastic` adds spare servers that start outside the group and
-//! can be added (learner, then voter) or removed while faults are injected.
-//!
-//! Failures print the seed and the tail of the operation history.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
@@ -31,7 +11,6 @@ use crate::raft::types::{
 
 static NEXT_SIM_ID: AtomicU64 = AtomicU64::new(0);
 
-/// Entries per AppendEntries in the simulation; small, to exercise batching.
 const SIM_BATCH: usize = 3;
 const HISTORY_TAIL: usize = 40;
 
@@ -56,7 +35,6 @@ impl Rng {
     }
 }
 
-/// How many servers are in exactly one of the two lists.
 fn changed(a: &[NodeId], b: &[NodeId]) -> usize {
     a.iter().filter(|id| !b.contains(id)).count() + b.iter().filter(|id| !a.contains(id)).count()
 }
@@ -73,16 +51,12 @@ fn fail(seed: u64, history: &[String], message: &str) -> ! {
 pub struct SimCluster {
     seed: u64,
     ids: Vec<NodeId>,
-    /// Servers `1..=initial_voters` form the starting group; the rest are
-    /// spares that join later.
     initial_voters: usize,
     dir: PathBuf,
     nodes: Vec<Option<RaftNode>>,
     group: Vec<u32>,
     rng: Rng,
     drop_per_mille: usize,
-    /// Every entry ever seen committed: index -> (entry, term of the node
-    /// that first reported it, i.e. the committing leader's term).
     committed: BTreeMap<u64, (LogEntry, u64)>,
     leader_of_term: HashMap<u64, NodeId>,
     last_term: Vec<u64>,
@@ -96,8 +70,6 @@ impl SimCluster {
         Self::elastic(name, size, 0, seed)
     }
 
-    /// `voters` servers start as the group; `spares` more exist but are not
-    /// members until a config change adds them.
     pub fn elastic(name: &str, voters: usize, spares: usize, seed: u64) -> Self {
         let size = voters + spares;
         let unique = NEXT_SIM_ID.fetch_add(1, Ordering::Relaxed);
@@ -136,8 +108,6 @@ impl SimCluster {
     fn open_node(&self, i: usize) -> RaftNode {
         let path = self.dir.join(format!("node{}.log", self.ids[i]));
 
-        // Spares know nothing until a leader tells them. Everyone else gets
-        // the bootstrap voters; a log that holds config entries overrides it.
         if i >= self.initial_voters {
             RaftNode::open_joining(self.ids[i], path).expect("open joining node")
         } else {
@@ -145,8 +115,6 @@ impl SimCluster {
                 .expect("open Raft node")
         }
     }
-
-    // ----------------------------------------------------------- accessors
 
     pub fn len(&self) -> usize {
         self.nodes.len()
@@ -183,10 +151,6 @@ impl SimCluster {
         self.rng.below(1000) >= self.drop_per_mille
     }
 
-    // ---------------------------------------------------------- operations
-
-    /// Node `i`'s election timer fires: it runs for office and asks everyone
-    /// it can reach.
     pub fn election_timeout(&mut self, i: usize) {
         if let Some(args) = self.start_candidacy(i) {
             self.solicit_votes(i, &args);
@@ -194,8 +158,6 @@ impl SimCluster {
         }
     }
 
-    /// Two nodes time out together: both become candidates (often for the
-    /// same term) before either collects a vote.
     pub fn concurrent_elections(&mut self, a: usize, b: usize) {
         if a == b {
             return;
@@ -220,7 +182,6 @@ impl SimCluster {
             return None;
         }
 
-        // Servers that are not voters cannot campaign; that is not an error.
         let args = self.nodes[i].as_mut().unwrap().start_election().ok()?;
 
         self.note(format!(
@@ -257,7 +218,6 @@ impl SimCluster {
         }
     }
 
-    /// Leader `i` sends one round of AppendEntries to every reachable peer.
     pub fn replicate(&mut self, i: usize) {
         if !self.is_alive(i) || self.node(i).role != Role::Leader {
             return;
@@ -284,8 +244,6 @@ impl SimCluster {
                 continue;
             }
 
-            // An error here would mean the protocol asked a follower to
-            // overwrite a committed entry, which must never happen.
             let reply = self.nodes[j]
                 .as_mut()
                 .unwrap()
@@ -312,7 +270,6 @@ impl SimCluster {
         self.check_invariants();
     }
 
-    /// A client write arrives at node `i` (accepted only if it is a leader).
     pub fn client_write(&mut self, i: usize) -> bool {
         if !self.is_alive(i) || self.node(i).role != Role::Leader {
             return false;
@@ -340,7 +297,6 @@ impl SimCluster {
         accepted
     }
 
-    /// Leader `i` proposes one membership change.
     pub fn propose(&mut self, i: usize, change: ConfigChange) -> std::io::Result<u64> {
         let result = self.nodes[i]
             .as_mut()
@@ -356,8 +312,6 @@ impl SimCluster {
         result
     }
 
-    /// Leader `i` proposes a random valid membership change (or does nothing
-    /// if it may not right now).
     pub fn random_config_change(&mut self, i: usize) {
         if !self.is_alive(i) || self.node(i).role != Role::Leader {
             return;
@@ -386,7 +340,6 @@ impl SimCluster {
         let _ = self.propose(i, change);
     }
 
-    /// Lose all volatile state; the disk survives.
     pub fn crash(&mut self, i: usize) {
         if self.nodes[i].take().is_some() {
             self.note(format!("node {} crashes", self.ids[i]));
@@ -399,14 +352,12 @@ impl SimCluster {
         }
 
         self.nodes[i] = Some(self.open_node(i));
-        // commit_index is volatile in Raft, so monotonicity restarts here.
         self.last_commit[i] = self.node(i).commit_index;
 
         self.note(format!("node {} restarts", self.ids[i]));
         self.check_invariants();
     }
 
-    /// Split the network: nodes can only talk within their own group.
     pub fn partition(&mut self, groups: &[&[usize]]) {
         for (number, members) in groups.iter().enumerate() {
             for member in *members {
@@ -427,7 +378,6 @@ impl SimCluster {
         self.note(format!("message loss {per_mille} per mille"));
     }
 
-    /// Run one random fault or protocol step.
     pub fn random_step(&mut self) {
         let n = self.len();
         let pick = self.rng.below(n);
@@ -455,7 +405,6 @@ impl SimCluster {
                 }
             }
             52..=74 => {
-                // Writes go to a leader when there is one, so they pile up.
                 let leaders = self.leaders();
 
                 if leaders.is_empty() {
@@ -482,8 +431,6 @@ impl SimCluster {
         }
     }
 
-    /// Replicate from leader `i` until every node has the same log and the
-    /// same commit index. Panics if that does not happen.
     pub fn replicate_until_converged(&mut self, i: usize) {
         if !self.replicate_until_converged_or_deposed(i) {
             fail(
@@ -494,8 +441,6 @@ impl SimCluster {
         }
     }
 
-    /// `true` once every member matches the leader; `false` if the leader
-    /// stepped down first (for instance after committing its own removal).
     fn replicate_until_converged_or_deposed(&mut self, i: usize) -> bool {
         for _ in 0..500 {
             self.replicate(i);
@@ -516,8 +461,6 @@ impl SimCluster {
         let reference = self.node(leader);
         let members = reference.config().members();
 
-        // Servers outside the leader's config (never added, or removed) are
-        // not sent anything, so they are not expected to catch up.
         self.alive()
             .into_iter()
             .filter(|i| members.contains(&self.ids[*i]) || *i == leader)
@@ -529,8 +472,6 @@ impl SimCluster {
             })
     }
 
-    /// Heal everything, restart everyone, and require the cluster to elect a
-    /// leader and commit a fresh write everywhere (liveness after faults).
     pub fn settle(&mut self) {
         self.heal();
         self.set_message_loss(0);
@@ -540,7 +481,6 @@ impl SimCluster {
         }
 
         for _ in 0..400 {
-            // Stale leaders discover the newer term when they talk.
             for leader in self.leaders() {
                 self.replicate(leader);
             }
@@ -557,8 +497,6 @@ impl SimCluster {
 
                     self.client_write(leader);
 
-                    // A leader that has just committed its own removal steps
-                    // down; the group then elects again, so keep looping.
                     if self.replicate_until_converged_or_deposed(leader) {
                         self.check_logs_identical(leader);
                         return;
@@ -576,7 +514,6 @@ impl SimCluster {
         );
     }
 
-    /// One line per node: role, term, log end, commit and config.
     fn describe(&self) -> String {
         (0..self.len())
             .map(|i| match &self.nodes[i] {
@@ -597,7 +534,6 @@ impl SimCluster {
             .join("\n")
     }
 
-    /// All members of `leader`'s config hold the same log as `leader`.
     pub fn check_logs_identical(&self, leader: usize) {
         let reference = self.node(leader);
         let members = reference.config().members();
@@ -634,8 +570,6 @@ impl SimCluster {
         })
     }
 
-    // ---------------------------------------------------------- invariants
-
     pub fn check_invariants(&mut self) {
         let seed = self.seed;
 
@@ -658,7 +592,6 @@ impl SimCluster {
                 fail(seed, &self.history, "commit index is beyond the log");
             }
 
-            // Election safety.
             if node.role == Role::Leader {
                 match self.leader_of_term.get(&node.current_term) {
                     Some(other) if *other != node.id => fail(
@@ -675,7 +608,6 @@ impl SimCluster {
                 }
             }
 
-            // State machine safety.
             for index in 1..=node.commit_index {
                 let Some(entry) = node.log.entry_at(index) else {
                     fail(seed, &self.history, "committed entry missing from log");
@@ -696,9 +628,6 @@ impl SimCluster {
             }
         }
 
-        // Leader completeness: a leader of a term at or after the term that
-        // committed an entry must hold it. (A stale leader from an earlier
-        // term legitimately does not.)
         for i in self.leaders() {
             let node = self.node(i);
 
@@ -716,8 +645,6 @@ impl SimCluster {
             }
         }
 
-        // The cached config must always equal the latest config entry in the
-        // log (this is what catches a missed rollback after truncation).
         for i in self.alive() {
             let node = self.node(i);
 
@@ -733,7 +660,6 @@ impl SimCluster {
             }
         }
 
-        // Committed membership changes move one server at a time.
         let mut previous = ClusterConfig::new(self.ids[..self.initial_voters].to_vec());
 
         for (index, (entry, _)) in &self.committed {
@@ -756,7 +682,6 @@ impl SimCluster {
             }
         }
 
-        // Log matching.
         let alive = self.alive();
 
         for (position, a) in alive.iter().enumerate() {
@@ -806,7 +731,6 @@ mod tests {
             sim.random_step();
         }
 
-        // After arbitrary faults the cluster must still be able to recover.
         sim.settle();
     }
 
@@ -822,7 +746,6 @@ mod tests {
         let committed_before = sim.node(0).commit_index;
         assert!(committed_before >= 2);
 
-        // The old leader keeps only one follower and keeps accepting writes.
         sim.partition(&[&[0, 1], &[2, 3, 4]]);
         sim.client_write(0);
         sim.client_write(0);
@@ -837,7 +760,6 @@ mod tests {
         assert!(sim.node(0).log.last_index() > committed_before);
         assert!(sim.log_contains_key(0, "key2"));
 
-        // The majority side elects a new leader and commits.
         sim.election_timeout(2);
         assert_eq!(sim.node(2).role, Role::Leader);
         sim.client_write(2);
@@ -846,7 +768,6 @@ mod tests {
         }
         assert!(sim.node(2).commit_index > committed_before);
 
-        // After healing, the old leader steps down and its writes vanish.
         sim.settle();
 
         assert_ne!(sim.node(0).role, Role::Leader);
@@ -863,8 +784,6 @@ mod tests {
         sim.election_timeout(0);
         sim.replicate_until_converged(0);
 
-        // The leader replicates one entry to a majority (itself and node 1),
-        // so it counts as committed, then crashes before telling anyone.
         sim.partition(&[&[0, 1], &[2]]);
         assert!(sim.client_write(0));
         sim.replicate(0);
@@ -873,18 +792,15 @@ mod tests {
         sim.crash(0);
         sim.heal();
 
-        // Node 2 is behind, so node 1 must refuse it.
         sim.election_timeout(2);
         assert_ne!(sim.node(2).role, Role::Leader);
 
-        // Node 1 has the entry and wins; the entry must reach node 2.
         sim.election_timeout(1);
         assert_eq!(sim.node(1).role, Role::Leader);
         sim.replicate_until_converged(1);
 
         assert!(sim.log_contains_key(2, "key1"));
 
-        // The crashed old leader rejoins as a follower and converges.
         sim.settle();
         assert!(sim.log_contains_key(0, "key1"));
     }
@@ -903,7 +819,6 @@ mod tests {
         assert_eq!(sim.node(0).role, Role::Leader);
         sim.replicate_until_converged(0);
 
-        // One server at a time: learner first, voter once it has caught up.
         for id in [4, 5] {
             sim.propose(0, ConfigChange::AddLearner(id))
                 .expect("add learner");
@@ -917,7 +832,6 @@ mod tests {
         assert_eq!(sim.node(0).quorum_size(), 3);
         sim.check_logs_identical(0);
 
-        // 5 voters tolerate 2 failures...
         sim.crash(1);
         sim.crash(2);
         let before = sim.node(0).commit_index;
@@ -927,7 +841,6 @@ mod tests {
         }
         assert!(sim.node(0).commit_index > before, "3 of 5 is a majority");
 
-        // ...but not 3.
         sim.crash(3);
         let stuck = sim.node(0).commit_index;
         assert!(sim.client_write(0));
@@ -961,13 +874,11 @@ mod tests {
 
         assert_eq!(sim.node(0).config().voters, vec![1, 2, 3]);
 
-        // New entries no longer reach the removed servers.
         let removed_before = sim.node(id_index(&sim, 5)).log.last_index();
         sim.client_write(0);
         sim.replicate_until_converged(0);
         assert_eq!(sim.node(id_index(&sim, 5)).log.last_index(), removed_before);
 
-        // The remaining three tolerate one failure.
         sim.crash(1);
         let before = sim.node(0).commit_index;
         assert!(sim.client_write(0));
@@ -986,20 +897,16 @@ mod tests {
         sim.election_timeout(0);
         sim.replicate_until_converged(0);
 
-        // The leader appends AddLearner(4) but crashes before anyone has it.
         sim.propose(0, ConfigChange::AddLearner(4))
             .expect("add learner");
         assert!(sim.node(0).config().learners == vec![4]);
         sim.crash(0);
 
-        // Another leader is elected from the old group; it never saw the change.
         sim.election_timeout(1);
         assert_eq!(sim.node(1).role, Role::Leader);
         assert!(sim.node(1).config().learners.is_empty());
         sim.replicate_until_converged(1);
 
-        // The old leader returns holding the orphaned config entry; the new
-        // leader's log overwrites it and the config reverts.
         sim.restart(0);
         assert_eq!(
             sim.node(0).config().learners,
@@ -1012,10 +919,6 @@ mod tests {
         assert!(!sim.node(0).config().is_member(4));
     }
 
-    /// A leader appends "remove myself" and crashes before anyone has it. It
-    /// restarts holding a longer log but is no longer a voter in its own log.
-    /// The survivor cannot win without its vote, so the removed-in-its-own-log
-    /// server must still be allowed to campaign.
     #[test]
     fn a_leader_that_crashes_while_removing_itself_does_not_strand_the_group() {
         let mut sim = SimCluster::elastic("remove_self_crash", 2, 0, 14);
@@ -1031,7 +934,6 @@ mod tests {
         sim.crash(1);
         sim.restart(1);
 
-        // Node 2's log is ahead, so it refuses node 1; node 1 cannot win alone.
         sim.election_timeout(0);
         assert_ne!(sim.node(0).role, Role::Leader);
         assert!(
@@ -1039,7 +941,6 @@ mod tests {
             "still a voter in the committed config"
         );
 
-        // Node 2 may campaign, and node 1 votes for the more up-to-date log.
         sim.election_timeout(1);
         assert_eq!(sim.node(1).role, Role::Leader);
 
@@ -1047,10 +948,6 @@ mod tests {
         assert_eq!(sim.node(0).config().voters, vec![1]);
     }
 
-    /// A learner is promoted before it has received anything (the sim does
-    /// not enforce the catch-up rule the rebalancer follows). The only
-    /// survivor that knows the new config needs that empty server's vote, and
-    /// an empty server must grant it even though it knows no config yet.
     #[test]
     fn a_voter_that_knows_no_config_yet_still_helps_elect_a_leader() {
         let mut sim = SimCluster::elastic("empty_voter", 2, 1, 15);
@@ -1076,7 +973,6 @@ mod tests {
             "server 3 knows nothing"
         );
 
-        // The leader dies; server 2 must win with server 3's vote alone.
         sim.crash(0);
         sim.heal();
         sim.election_timeout(1);
@@ -1132,7 +1028,6 @@ mod tests {
         }
     }
 
-    /// Replay one seed of the soak (debugging aid).
     #[test]
     #[ignore]
     fn replay_soak_seed() {
@@ -1150,7 +1045,6 @@ mod tests {
         sim.settle();
     }
 
-    /// Longer soak run: `cargo test --lib raft::sim -- --ignored`
     #[test]
     #[ignore]
     fn random_faults_soak() {
@@ -1158,7 +1052,6 @@ mod tests {
             run_random(seed, 3, 1200);
             run_random(seed + 10_000, 5, 1200);
 
-            // Spare servers join and leave while faults are injected.
             let mut sim = SimCluster::elastic("soak_members", 3, 2, seed + 20_000);
             for _ in 0..1200 {
                 sim.random_step();

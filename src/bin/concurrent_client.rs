@@ -1,6 +1,6 @@
 use kv_store::net::framing::{FrameDecoder, encode_frame};
 
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::net::TcpStream;
 use std::sync::{Arc, Barrier};
 use std::thread;
@@ -10,12 +10,10 @@ const SERVER_ADDR: &str = "127.0.0.1:6379";
 const CLIENT_COUNT: usize = 6;
 
 fn send_command(stream: &mut TcpStream, command: &str) -> io::Result<String> {
-    // Encode the command into our existing length-prefixed frame.
     let frame = encode_frame(command.as_bytes())?;
 
     stream.write_all(&frame)?;
 
-    // Wait for the framed response.
     let mut decoder = FrameDecoder::new();
 
     loop {
@@ -38,9 +36,6 @@ fn send_command(stream: &mut TcpStream, command: &str) -> io::Result<String> {
 fn main() -> io::Result<()> {
     println!("Starting {} concurrent clients...", CLIENT_COUNT);
 
-    // Every thread waits here until all clients
-    // are ready. This makes the requests start
-    // at approximately the same time.
     let barrier = Arc::new(Barrier::new(CLIENT_COUNT));
 
     let mut handles = Vec::new();
@@ -49,17 +44,14 @@ fn main() -> io::Result<()> {
         let barrier = Arc::clone(&barrier);
 
         let handle = thread::spawn(move || -> io::Result<()> {
-            // Each client has its own TCP connection.
             let mut stream = TcpStream::connect(SERVER_ADDR)?;
 
             println!("Client {} connected", client_id);
 
-            // Wait until every client is connected.
             barrier.wait();
 
             let start = Instant::now();
 
-            // Each client performs a different operation.
             let command = match client_id {
                 0 => "SET name Baiju".to_string(),
 
@@ -90,7 +82,6 @@ fn main() -> io::Result<()> {
         handles.push(handle);
     }
 
-    // Wait for every client to finish.
     for handle in handles {
         handle.join().expect("client thread panicked")?;
     }

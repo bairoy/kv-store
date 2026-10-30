@@ -1,13 +1,4 @@
 //! Consistent hashing with virtual nodes.
-//!
-//! Servers (and keys) are hashed onto a circle of `u64` positions. A key is
-//! owned by the first server found walking clockwise from the key's position,
-//! wrapping past the top back to the smallest position. Adding or removing a
-//! server only changes ownership of the arcs next to its positions, so about
-//! `1/N` of the keys move instead of nearly all of them (as with `hash % N`).
-//!
-//! Each server is placed at many positions ("virtual nodes") so every server
-//! ends up with roughly the same total arc length.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -16,13 +7,11 @@ use crate::shard::hash::stable_hash;
 
 #[derive(Debug, Clone)]
 pub struct ConsistentHashRing {
-    /// Ring position -> physical server.
     ring: BTreeMap<u64, NodeId>,
     vnodes: u32,
 }
 
 impl ConsistentHashRing {
-    /// `vnodes` positions per server (clamped to at least 1).
     pub fn new(vnodes: u32) -> Self {
         Self {
             ring: BTreeMap::new(),
@@ -34,7 +23,6 @@ impl ConsistentHashRing {
         self.ring.is_empty()
     }
 
-    /// The distinct physical servers on the ring, in id order.
     pub fn nodes(&self) -> Vec<NodeId> {
         self.ring
             .values()
@@ -44,7 +32,6 @@ impl ConsistentHashRing {
             .collect()
     }
 
-    /// Place `node` on the ring. Adding the same node twice changes nothing.
     pub fn add_node(&mut self, node: NodeId) {
         for vnode in 0..self.vnodes {
             let mut salt = 0u32;
@@ -63,10 +50,7 @@ impl ConsistentHashRing {
                         self.ring.insert(position, node);
                         break;
                     }
-                    // Already placed by an earlier add_node of this server.
                     Some(existing) if *existing == node => break,
-                    // Another server holds this exact position (astronomically
-                    // rare): re-hash with a salt instead of overwriting it.
                     Some(_) => salt += 1,
                 }
             }
@@ -77,22 +61,16 @@ impl ConsistentHashRing {
         self.ring.retain(|_, owner| *owner != node);
     }
 
-    /// The server that owns `key`, or `None` if the ring is empty.
     pub fn owner(&self, key: &str) -> Option<NodeId> {
         let hash = stable_hash(key);
 
         self.ring
-            .range(hash..) // positions at or after the key
-            .next() // the first one clockwise...
-            .or_else(|| self.ring.iter().next()) // ...or wrap to the start
+            .range(hash..)
+            .next()
+            .or_else(|| self.ring.iter().next())
             .map(|(_, node)| *node)
     }
 
-    /// Up to `count` *distinct* servers found walking clockwise from `key`.
-    ///
-    /// The first entry is the owner. Used to pick the replica set of a
-    /// partition: when a server joins or leaves, only the partitions near its
-    /// positions change their replica set.
     pub fn replicas_for(&self, key: &str, count: usize) -> Vec<NodeId> {
         let hash = stable_hash(key);
         let mut found = Vec::new();
@@ -141,7 +119,6 @@ mod tests {
 
     #[test]
     fn lookup_walks_clockwise_and_wraps_around() {
-        // Hand-placed ring: A=20, B=50, C=80 (the example from the notes).
         let mut ring = ConsistentHashRing::new(1);
         ring.ring.insert(20, 1);
         ring.ring.insert(50, 2);
@@ -182,7 +159,6 @@ mod tests {
             assert_eq!(sorted.len(), 3, "replicas must be distinct servers");
         }
 
-        // Asking for more than exist returns everyone once.
         assert_eq!(ring.replicas_for("k", 10).len(), 4);
     }
 
@@ -197,9 +173,6 @@ mod tests {
         assert_eq!(before, after);
     }
 
-    /// The headline property: going from 4 to 5 servers moves about 1/5 of
-    /// the keys, and every moved key moves *to the new server* (never
-    /// shuffled between old servers). `hash % N` moves ~80%.
     #[test]
     fn adding_a_server_moves_about_one_nth_of_the_keys_and_only_to_it() {
         let keys = keys(50_000);
@@ -225,7 +198,6 @@ mod tests {
             fraction * 100.0
         );
 
-        // The naive scheme for comparison.
         let modulo_moved = keys
             .iter()
             .filter(|k| stable_hash(k) % 4 != stable_hash(k) % 5)
@@ -276,8 +248,6 @@ mod tests {
         assert!(lumpy > smooth, "one position per server should be lumpier");
     }
 
-    /// Real key spaces cluster (same prefix, sequential suffix); a uniform
-    /// random test would hide hotspotting.
     #[test]
     fn skewed_key_patterns_still_spread_evenly() {
         let ring = ring_with(&[0, 1, 2, 3], 200);

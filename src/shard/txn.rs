@@ -1,33 +1,4 @@
-//! Atomic writes across partitions: two-phase commit where every step is a
-//! Raft entry.
-//!
-//! ```text
-//! TXN SET a 1 ; SET b 2 ; DELETE c          (keys may live in different partitions)
-//!
-//! group the writes by partition;  coordinator = the lowest participating partition
-//!
-//! phase 1  PREPARE  -> every participant partition (a Raft entry in each group):
-//!                      lock the keys and vote YES, or vote NO if a key is
-//!                      already locked by another transaction
-//! decision DECIDE   -> the coordinator partition (a Raft entry): COMMIT if
-//!                      everybody voted YES, else ABORT. The FIRST decision
-//!                      recorded wins; this is the commit point.
-//! phase 2  FINISH   -> every participant (a Raft entry): apply the writes
-//!                      (or discard them) and release the locks
-//! ```
-//!
-//! Classic two-phase commit blocks forever if the coordinator dies between
-//! the phases, with participants holding locks. Here the coordinator is not a
-//! process but a *replicated log*: the decision is durable and any leader can
-//! read it. A participant stuck in "prepared" for longer than the timeout
-//! asks the coordinator partition for the decision; if there is none it
-//! writes ABORT there (first writer wins, so this cannot race with a slow
-//! coordinator that is about to commit: one of the two decisions is simply
-//! recorded first and the other learns of it).
-//!
-//! Limits: writes only (`SET`/`DELETE`, no reads inside a transaction), and
-//! plain reads do not see locks, so a reader can briefly observe one
-//! partition's part of a committed transaction before another's.
+//! Atomic writes across partitions (two-phase commit over Raft).
 
 use std::collections::BTreeMap;
 use std::sync::atomic::Ordering;
@@ -35,7 +6,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::time::sleep;
 
+use crate::metrics;
 use crate::net::protocol::{Command as ClientCommand, Response, encode_response, parse_request};
+use crate::net::request::Session;
 use crate::raft::txn::{self, ops_from_hex, ops_to_hex};
 use crate::raft::types::{Role, TxnCommand, TxnOp};
 use crate::shard::node::{ShardNode, decode_value, error_response};
@@ -44,10 +17,8 @@ use crate::shard::routing::PartitionId;
 const STEP_ATTEMPTS: usize = 20;
 const RETRY_PAUSE: Duration = Duration::from_millis(100);
 
-/// `;` between writes, with spaces around it so values may contain `;`.
 const SEPARATOR: &str = " ; ";
 
-/// One step of the protocol, as sent to a partition's leader.
 enum Step<'a> {
     Prepare {
         id: &'a str,
@@ -73,7 +44,6 @@ fn verdict(commit: bool) -> &'static str {
 }
 
 impl Step<'_> {
-    /// The local admin command (`TXNOP`) that carries this step.
     fn command(&self, partition: PartitionId) -> Result<String, String> {
         Ok(match self {
             Step::Prepare {
@@ -104,17 +74,20 @@ impl Step<'_> {
 }
 
 impl ShardNode {
-    // ---------------------------------------------------------- coordinator
-
-    /// `TXN <writes>`: run a transaction, answering `+OK` only if it committed.
-    pub(crate) async fn transaction(&self, text: &str) -> String {
-        match self.run_transaction(text).await {
-            Ok(()) => encode_response(Response::Ok),
-            Err(message) => error_response(message),
+    pub(crate) async fn transaction(&self, text: &str, session: Option<&Session>) -> String {
+        match self.run_transaction(text, session).await {
+            Ok(()) => {
+                metrics::inc("txn_total", &[("outcome", "committed")]);
+                encode_response(Response::Ok)
+            }
+            Err(message) => {
+                metrics::inc("txn_total", &[("outcome", "failed")]);
+                error_response(message)
+            }
         }
     }
 
-    async fn run_transaction(&self, text: &str) -> Result<(), String> {
+    async fn run_transaction(&self, text: &str, session: Option<&Session>) -> Result<(), String> {
         let writes = parse_writes(text)?;
         let table = self.table();
 
@@ -128,9 +101,28 @@ impl ShardNode {
 
         let participants: Vec<PartitionId> = by_partition.keys().copied().collect();
         let coordinator = participants[0];
-        let id = self.next_txn_id();
+        let id = match session {
+            Some(session) => session.txn_id(),
+            None => self.next_txn_id(),
+        };
 
-        // ---- phase 1: prepare everywhere ----
+        if session.is_some() {
+            match self.txn_step(coordinator, Step::Status { id: &id }).await {
+                Ok(verdict) if verdict == "COMMIT" => {
+                    metrics::inc("txn_retries_answered_total", &[]);
+                    return Ok(());
+                }
+                Ok(verdict) if verdict == "ABORT" => {
+                    return Err(
+                        "transaction aborted by an earlier attempt of this request; \
+                         retry with a new request number"
+                            .to_string(),
+                    );
+                }
+                _ => {}
+            }
+        }
+
         let mut abort_reason = None;
 
         for (partition, ops) in &by_partition {
@@ -157,7 +149,6 @@ impl ShardNode {
             }
         }
 
-        // ---- decision: one Raft entry in the coordinator partition ----
         let wanted_commit = abort_reason.is_none();
 
         let decision = self
@@ -179,10 +170,6 @@ impl ShardNode {
 
         let committed = decision == "COMMIT";
 
-        // ---- phase 2: finish everywhere ----
-        // Sent to every participant, even ones never reached: a Finish that
-        // finds nothing prepared just leaves a tombstone, which makes a late
-        // Prepare harmless. Anyone we cannot reach is cleaned up by recovery.
         for partition in &participants {
             for _ in 0..3 {
                 let step = Step::Finish {
@@ -220,13 +207,11 @@ impl ShardNode {
         )
     }
 
-    /// Run one protocol step on whichever server leads `partition`.
     async fn txn_step(&self, partition: PartitionId, step: Step<'_>) -> Result<String, String> {
         let command = step.command(partition)?;
         let mut last_error = "no attempt made".to_string();
 
         for _ in 0..STEP_ATTEMPTS {
-            // Re-read the table each time: a rebalance may have moved it.
             let candidates = self.table().replicas(partition).to_vec();
             let (leader, _) = self.find_leader(partition, &candidates).await?;
 
@@ -244,9 +229,6 @@ impl ShardNode {
         Err(last_error)
     }
 
-    // ------------------------------------------------- local admin (TXNOP)
-
-    /// `TXNOP <partition> PREPARE|DECIDE|FINISH|STATUS ...`, leader only.
     pub(crate) async fn txn_operation(&self, rest: &str) -> String {
         match self.txn_operation_inner(rest).await {
             Ok(value) => encode_response(Response::Value(value)),
@@ -318,10 +300,6 @@ impl ShardNode {
         }
     }
 
-    // -------------------------------------------------------------- recovery
-
-    /// Forever: find transactions stuck in "prepared" on partitions we lead
-    /// and resolve them from the coordinator partition's decision.
     pub(crate) async fn run_txn_recovery(self: std::sync::Arc<Self>) {
         let pause = (self.txn_timeout / 4).max(Duration::from_millis(100));
 
@@ -333,7 +311,6 @@ impl ShardNode {
                     continue;
                 };
 
-                // Only the leader acts, so replicas do not all do the work.
                 if group.leader_status().await.0 != Role::Leader {
                     continue;
                 }
@@ -347,8 +324,6 @@ impl ShardNode {
         }
     }
 
-    /// Learn the verdict from the coordinator partition (forcing ABORT if it
-    /// has none) and finish the transaction here.
     async fn resolve_stuck(&self, partition: PartitionId, pending: &txn::PendingTxn) {
         let id = pending.id.as_str();
 
@@ -357,12 +332,10 @@ impl ShardNode {
             .await
         {
             Ok(decision) => decision,
-            Err(_) => return, // coordinator partition unreachable: try again later
+            Err(_) => return,
         };
 
         let decision = if known == "NONE" {
-            // Nobody decided. Record ABORT; if a slow coordinator decided in
-            // the meantime, that decision wins and is what we get back.
             match self
                 .txn_step(pending.coordinator, Step::Decide { id, commit: false })
                 .await
@@ -381,7 +354,7 @@ impl ShardNode {
             .await
             .is_ok()
         {
-            println!(
+            tracing::info!(
                 "Shard {}: resolved stuck transaction {id} on partition {partition}: {decision}",
                 self.id
             );
@@ -389,8 +362,6 @@ impl ShardNode {
     }
 }
 
-/// `SET a 1 ; DELETE b ; ...` into writes. Rejects reads, reserved keys and
-/// the same key twice (its meaning would be ambiguous).
 fn parse_writes(text: &str) -> Result<Vec<TxnOp>, String> {
     let mut writes = Vec::new();
 
@@ -448,7 +419,6 @@ mod tests {
             ]
         );
 
-        // A value may contain a bare `;`.
         assert_eq!(
             parse_writes("SET a x;y").unwrap(),
             vec![TxnOp::Set {

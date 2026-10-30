@@ -6,7 +6,10 @@ impl LsmStore {
     pub(super) fn append_wal(&mut self, record: &str) -> io::Result<()> {
         self.wal.write_all(record.as_bytes())?;
         self.wal.flush()?;
+
+        let started = std::time::Instant::now();
         self.wal.get_ref().sync_all()?;
+        crate::metrics::observe_duration("wal_fsync_seconds", &[], started.elapsed());
 
         Ok(())
     }

@@ -13,7 +13,6 @@ pub enum Response {
 }
 
 pub fn parse_request(request: &str) -> Option<Command> {
-    // let line = request.trim_end_matches("\r\n");
     let parts: Vec<&str> = request.splitn(3, ' ').collect();
 
     match parts.as_slice() {
@@ -31,7 +30,7 @@ pub fn encode_response(response: Response) -> String {
     match response {
         Response::Ok => "+OK".to_string(),
         Response::Value(value) => {
-            format!("${}\r\n{}\r\n", value.as_bytes().len(), value)
+            format!("${}\r\n{}\r\n", value.len(), value)
         }
         Response::NotFound => "$-1\r\n".to_string(),
         Response::Error(message) => {

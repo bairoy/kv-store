@@ -1,8 +1,4 @@
 //! A Raft snapshot: the full state machine as of `last_included_index`.
-//!
-//! Once a snapshot is durable, log entries up to that index can be discarded
-//! (Raft paper, section 7). The same encoding is used on disk and as the
-//! payload streamed by InstallSnapshot.
 
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -23,8 +19,6 @@ const MAX_SNAPSHOT_BYTES: u64 = 1024 * 1024 * 1024;
 pub struct RaftSnapshot {
     pub last_included_index: u64,
     pub last_included_term: u64,
-    /// Who was in the group as of `last_included_index`. Needed because the
-    /// config entries that established it are discarded with the log prefix.
     pub config: ClusterConfig,
     pub entries: BTreeMap<String, String>,
 }
@@ -59,7 +53,6 @@ impl RaftSnapshot {
         let mut cursor = HEADER_SIZE;
         let config = read_config(bytes, &mut cursor)?;
 
-        // Every entry takes at least 8 bytes, so a larger count is corrupt.
         if count > bytes.len() as u64 {
             return Err(invalid_data("invalid snapshot entry count"));
         }
@@ -104,7 +97,6 @@ impl RaftSnapshot {
         Self::decode(&bytes)
     }
 
-    /// Read just `(last_included_index, last_included_term)` from a file.
     pub fn read_meta(path: impl AsRef<Path>) -> io::Result<(u64, u64)> {
         let mut header = [0u8; HEADER_SIZE];
         File::open(path)?.read_exact(&mut header)?;

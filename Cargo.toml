@@ -2,7 +2,32 @@
 name = "kv-store"
 version = "0.1.0"
 edition = "2024"
+description = "A sharded, replicated key-value store in Rust: LSM-tree storage, Raft consensus, consistent-hash partitioning with online rebalancing, and cross-partition transactions"
+license = "MIT"
+readme = "README.md"
+keywords = ["raft", "distributed-systems", "key-value-store", "lsm-tree", "sharding"]
+categories = ["database-implementations"]
+
+[features]
+# Deliberately breaks a safety rule (see raft::session) so a chaos run can be
+# shown to *fail*: a test that cannot fail proves nothing. Never enable it in
+# a real deployment.
+fault-injection = []
+# The public demo: an HTTP gateway and a small web page (src/bin/gateway.rs, web/).
+gateway = ["dep:axum", "dep:serde_json"]
 
 [dependencies]
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json", "query"], optional = true }
+serde_json = { version = "1", optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pki-types = "1.15.1"
 tokio = { version = "1.53.1", features = ["full"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
+
+[[bin]]
+name = "gateway"
+path = "src/bin/gateway/main.rs"
+required-features = ["gateway"]

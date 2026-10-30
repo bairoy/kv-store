@@ -18,7 +18,6 @@ impl BloomFilter {
         }
     }
 
-    /// Create a Bloom filter sized for approximately `item_count` keys.
     pub fn for_items(item_count: usize) -> Self {
         let bits_per_key = 10;
 
@@ -27,11 +26,6 @@ impl BloomFilter {
         Self::new(bit_count, 7)
     }
 
-    /// Generate all hash positions for a key.
-    ///
-    /// We return a Vec instead of an iterator because the iterator
-    /// would need to borrow both `self` and `key`, creating a lifetime
-    /// relationship that is unnecessary here.
     fn hashes(&self, key: &str) -> Vec<usize> {
         (0..self.k)
             .map(|i| {
@@ -44,17 +38,12 @@ impl BloomFilter {
             .collect()
     }
 
-    /// Insert a key into the Bloom filter.
     pub fn insert(&mut self, key: &str) {
         for index in self.hashes(key) {
             self.bits[index] = true;
         }
     }
 
-    /// Check whether a key might exist.
-    ///
-    /// false => definitely does not exist
-    /// true  => might exist
     pub fn might_contain(&self, key: &str) -> bool {
         self.hashes(key).into_iter().all(|index| self.bits[index])
     }
@@ -67,16 +56,6 @@ impl BloomFilter {
         self.k
     }
 
-    /// Theoretical false-positive probability.
-    ///
-    /// Formula:
-    ///
-    /// `p = (1 - e^(-kn/m))^k`
-    ///
-    /// where:
-    ///     m = number of bits
-    ///     k = number of hash functions
-    ///     n = number of inserted keys
     pub fn estimated_false_positive_rate(&self, n: usize) -> f64 {
         let m = self.bits.len() as f64;
         let k = self.k as f64;

@@ -1,13 +1,4 @@
-//! The two-level mapping from a key to the servers that store it:
-//!
-//! ```text
-//! key --stable_hash % partition_count--> PartitionId      (fixed forever)
-//! PartitionId --RoutingTable (epoch)--> replica servers   (changes on rebalance)
-//! ```
-//!
-//! The partition count is chosen once and never changes, so adding a server
-//! never re-hashes a key. Only the table changes, and every change bumps the
-//! `epoch` so stale copies can be detected.
+//! The two-level mapping from a key to the servers that store it.
 
 use std::collections::{BTreeSet, HashMap};
 
@@ -17,8 +8,6 @@ use crate::shard::ring::ConsistentHashRing;
 
 pub type PartitionId = u32;
 
-/// Which partition a key belongs to. Depends only on the key and the (fixed)
-/// partition count, never on how many servers exist.
 pub fn partition_for(key: &str, partition_count: u32) -> PartitionId {
     (stable_hash(key) % u64::from(partition_count.max(1))) as PartitionId
 }
@@ -26,12 +15,9 @@ pub fn partition_for(key: &str, partition_count: u32) -> PartitionId {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PartitionInfo {
     pub id: PartitionId,
-    /// The servers holding a replica (one Raft group). Listed in ring order,
-    /// so the first entry is the preferred leader.
     pub replicas: Vec<NodeId>,
 }
 
-/// One partition whose replica set changes between two tables.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PartitionMove {
     pub partition: PartitionId,
@@ -41,14 +27,11 @@ pub struct PartitionMove {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RoutingTable {
-    /// Bumped on every change; requests carry it so stale routers are caught.
     pub epoch: u64,
     partitions: Vec<PartitionInfo>,
 }
 
 impl RoutingTable {
-    /// Place every partition on `replication` distinct servers by walking the
-    /// ring clockwise from the hash of `partition-<id>`.
     pub fn build(
         ring: &ConsistentHashRing,
         partition_count: u32,
@@ -81,8 +64,6 @@ impl RoutingTable {
         Ok(Self { epoch, partitions })
     }
 
-    /// A copy with one partition's replicas replaced and a new epoch. Used to
-    /// publish a partition move: the table changes one partition at a time.
     pub fn with_partition(
         &self,
         partition: PartitionId,
@@ -99,8 +80,6 @@ impl RoutingTable {
         next
     }
 
-    /// One line, easy to send over the text protocol and to store on disk:
-    /// `epoch=7 0:1,2,3 1:2,3,4 ...`
     pub fn encode(&self) -> String {
         let mut parts = vec![format!("epoch={}", self.epoch)];
 
@@ -178,7 +157,6 @@ impl RoutingTable {
         &self.partitions
     }
 
-    /// The partitions a server holds a replica of.
     pub fn hosted_by(&self, node: NodeId) -> Vec<PartitionId> {
         self.partitions
             .iter()
@@ -187,10 +165,6 @@ impl RoutingTable {
             .collect()
     }
 
-    /// What must change to get from `self` to `newer`: for each affected
-    /// partition, which servers gain a replica and which lose one. This is
-    /// the *plan* for a rebalance; executing it safely is a separate job
-    /// (snapshot, catch-up, Raft membership change, then publish).
     pub fn diff(&self, newer: &RoutingTable) -> Result<Vec<PartitionMove>, String> {
         if self.partition_count() != newer.partition_count() {
             return Err("the partition count must never change".to_string());
@@ -214,7 +188,6 @@ impl RoutingTable {
         Ok(moves)
     }
 
-    /// How many partitions each server hosts (for balance checks / display).
     pub fn load(&self) -> HashMap<NodeId, usize> {
         let mut load = HashMap::new();
 
@@ -273,7 +246,6 @@ mod tests {
             assert_eq!(replicas.len(), 3);
         }
 
-        // 64 partitions x 3 replicas over 4 servers = 48 each on average.
         let load = table.load();
         for server in 1..=4 {
             let hosted = load[&server];
@@ -299,10 +271,6 @@ mod tests {
         assert!(RoutingTable::build(&ConsistentHashRing::new(10), 8, 1, 1).is_err());
     }
 
-    /// Adding the 5th server must (a) only ever add that server to a
-    /// partition, (b) remove exactly one old replica each time, (c) leave
-    /// every other partition untouched, and (d) move about 1/5 of all
-    /// replica slots, the minimum needed to balance 5 servers.
     #[test]
     fn adding_a_server_produces_a_minimal_rebalance_plan() {
         let old = RoutingTable::build(&ring(&[1, 2, 3, 4]), 256, 3, 1).unwrap();
@@ -326,7 +294,6 @@ mod tests {
             fraction * 100.0
         );
 
-        // Partitions not in the plan are identical as sets.
         let touched: BTreeSet<_> = moves.iter().map(|m| m.partition).collect();
         for info in old.partitions() {
             if !touched.contains(&info.id) {

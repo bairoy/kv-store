@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Build everything (library, servers, tools)
+        run: cargo build --all-targets
+
+      - name: Tests (the two long random-fault soak tests are ignored)
+        run: cargo test --lib
+
+      - name: Gateway (live demo) builds and passes its tests
+        run: cargo test --features gateway --bin gateway
+
+  chaos:
+    # A short chaos run against the real binaries: kill -9 under load, then
+    # check the invariants. Also proves the checker can fail.
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - run: cargo build --bins
+
+      - name: Chaos run with faults (must pass)
+        run: ./target/debug/chaos --seconds 40 --seed 7
+
+      - name: Chaos run with deduplication sabotaged (must FAIL)
+        run: |
+          cargo build --bins --features fault-injection --target-dir target/fault
+          if KV_FAULT_NO_DEDUP=1 ./target/fault/debug/chaos --seconds 40 --seed 7; then
+            echo "the checker did not notice the sabotage"; exit 1
+          fi

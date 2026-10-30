@@ -1,49 +1,102 @@
-use kv_store::net::framing::{FrameDecoder, encode_frame};
+//! Interactive client.
+
+use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
-use std::net::TcpStream;
+
+use kv_store::client::{Client, ClientError, ClientOptions, Reply};
 
 fn main() -> io::Result<()> {
-    // Usage: client [address]   (default: the V8 leader on 127.0.0.1:7878)
-    let address = std::env::args()
+    let arg = std::env::args()
         .nth(1)
+        .or_else(|| std::env::var("KV_SERVERS").ok())
         .unwrap_or_else(|| "127.0.0.1:7878".to_string());
-    let mut stream = TcpStream::connect(&address)?;
+
+    let mut servers: Vec<String> = arg.split(',').map(str::to_string).collect();
+    let mut options = ClientOptions::from_env().unwrap_or_else(|error| {
+        eprintln!("security configuration: {error}");
+        std::process::exit(2);
+    });
+
+    add_known_cluster(&mut servers, &mut options);
+
+    let mut client = Client::with_options(servers.clone(), options);
+
+    println!("connected to KV cluster via {}", servers.join(", "));
+    println!("client id {}; type 'stats' or 'quit'", client.id());
+
     let stdin = io::stdin();
-    let mut decoder = FrameDecoder::new();
-    println!("connected to KV server");
-    println!("type 'quit' to exit");
 
     loop {
         print!("> ");
         io::stdout().flush()?;
+
         let mut input = String::new();
-        stdin.lock().read_line(&mut input)?;
-        let command = input.trim_end();
-        if command == "quit" {
+
+        if stdin.lock().read_line(&mut input)? == 0 {
             break;
         }
-        if command.is_empty() {
-            continue;
+
+        let line = input.trim_end();
+
+        match line {
+            "" => continue,
+            "quit" => break,
+            "stats" => {
+                println!("{:?}", client.stats());
+                continue;
+            }
+            _ => {}
         }
 
-        let frame = encode_frame(command.as_bytes())?;
-        stream.write_all(&frame)?;
-        loop {
-            if let Some(response) = decoder.next_frame()? {
-                let response = String::from_utf8(response).map_err(|_| {
-                    io::Error::new(io::ErrorKind::InvalidData, "invalid UTF-8 response")
-                })?;
-                println!("{response}");
-                break;
+        match client.execute_line(line) {
+            Ok(Reply::Ok) => println!("+OK"),
+            Ok(Reply::Value(value)) => println!("{value}"),
+            Ok(Reply::NotFound) => println!("(not found)"),
+            Ok(Reply::Error(message)) => println!("-ERR {message}"),
+            Err(ClientError::Rejected(message)) => println!("-ERR {message}"),
+            Err(error) => println!("-ERR {error}"),
+        }
+    }
+
+    Ok(())
+}
+
+fn add_known_cluster(servers: &mut Vec<String>, options: &mut ClientOptions) {
+    let ports: Vec<u16> = servers
+        .iter()
+        .filter_map(|address| address.rsplit(':').next()?.parse().ok())
+        .collect();
+
+    if ports.contains(&7878) {
+        options.idempotent_writes = false;
+    }
+
+    let raft = ports.iter().any(|port| (7101..=7103).contains(port));
+    let shard = ports.iter().any(|port| (7201..=7205).contains(port));
+
+    if raft {
+        let mut leaders = HashMap::new();
+
+        for node in 1..=3u64 {
+            let address = format!("127.0.0.1:{}", 7100 + node);
+
+            leaders.insert(node, address.clone());
+
+            if !servers.contains(&address) {
+                servers.push(address);
             }
-            let bytes_read = decoder.read_from(&mut stream)?;
-            if bytes_read == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "server closed connection",
-                ));
+        }
+
+        options.leader_addresses = leaders;
+    }
+
+    if shard {
+        for node in 1..=5u64 {
+            let address = format!("127.0.0.1:{}", 7200 + node);
+
+            if !servers.contains(&address) {
+                servers.push(address);
             }
         }
     }
-    Ok(())
 }

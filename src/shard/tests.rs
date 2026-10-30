@@ -1,5 +1,4 @@
-//! End-to-end tests of the sharded cluster: real servers on localhost
-//! sharing nothing but TCP.
+//! End-to-end tests of the sharded cluster.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -23,7 +22,6 @@ fn temp_dir(name: &str) -> PathBuf {
         .join(format!("{name}_{}_{id}", std::process::id()))
 }
 
-/// Bind port 0 to let the OS pick a free port, then release it.
 fn free_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0")
         .expect("bind")
@@ -32,7 +30,6 @@ fn free_port() -> u16 {
         .port()
 }
 
-/// `initial` servers form the starting table; `spares` can be added later.
 fn cluster_config(
     name: &str,
     initial: &[NodeId],
@@ -75,13 +72,16 @@ fn cluster_config(
             vnodes: 100,
             rebalance_pause: Duration::from_millis(5),
             txn_timeout: Duration::from_millis(600),
+            max_connections: 1024,
+            max_pending_writes: 1024,
+            bind: None,
+            security: crate::net::security::Security::plain(),
         })
         .collect();
 
     (configs, data_dir)
 }
 
-/// Give every server the same transaction-recovery timeout.
 fn with_txn_timeout(mut configs: Vec<ShardConfig>, timeout: Duration) -> Vec<ShardConfig> {
     for config in &mut configs {
         config.txn_timeout = timeout;
@@ -94,7 +94,6 @@ async fn ask(address: &str, request: &str) -> String {
     send_request(address, request).await.expect("request")
 }
 
-/// Retry until the cluster has elected leaders and the command succeeds.
 async fn ask_until_ok(address: &str, request: &str) -> String {
     let deadline = Instant::now() + Duration::from_secs(30);
 
@@ -116,7 +115,6 @@ fn bulk(value: &str) -> String {
     format!("${}\r\n{value}\r\n", value.len())
 }
 
-/// A running cluster: handles to every server plus where to reach them.
 struct Cluster {
     nodes: Vec<Arc<ShardNode>>,
     clients: Vec<String>,
@@ -148,7 +146,6 @@ impl Cluster {
         }
     }
 
-    /// Index of the server with this id.
     fn at(&self, id: NodeId) -> usize {
         self.nodes
             .iter()
@@ -165,7 +162,6 @@ impl Cluster {
         }
     }
 
-    /// Every key must be readable, with the right value, through every server.
     async fn assert_keys(&self, prefix: &str, range: std::ops::Range<usize>, via: &[NodeId]) {
         for i in range {
             for id in via {
@@ -183,9 +179,6 @@ impl Cluster {
 }
 
 impl Cluster {
-    /// Every server the *current* table lists as a replica of a key's
-    /// partition must hold that key in its own store. This is what proves the
-    /// data really moved, not merely that requests get routed.
     async fn assert_every_replica_holds(&self, prefix: &str, range: std::ops::Range<usize>) {
         let table = self.nodes[0].table();
 
@@ -198,8 +191,6 @@ impl Cluster {
                 let deadline = Instant::now() + Duration::from_secs(10);
 
                 loop {
-                    // A follower applies a commit one heartbeat after the
-                    // leader does, so give it a moment.
                     if node.local_get(partition, &key).await == Some(format!("value-{i}")) {
                         break;
                     }
@@ -217,8 +208,6 @@ impl Cluster {
 }
 
 impl Cluster {
-    /// For every partition, every replica the table lists must report the
-    /// same Raft membership: voters == the table's replicas, no learners.
     async fn assert_membership_matches_table(&self) {
         let table = self.nodes[0].table();
 
@@ -271,18 +260,15 @@ async fn introspection_and_forward_validation_work_without_a_cluster() {
     let (mut configs, data_dir) = cluster_config("introspect", &[1, 2, 3], &[], 4, 2);
     let node = ShardNode::open(configs.remove(0)).expect("open");
 
-    // ROUTE names the partition and replicas without touching Raft.
     let route = node.process("ROUTE user:1").await;
     assert!(route.contains("partition="));
     assert!(route.contains("epoch=1"));
 
-    // STATUS lists exactly the hosted partitions.
     let status = node.process("STATUS").await;
     for partition in node.hosted_partitions() {
         assert!(status.contains(&format!("p{partition}:")));
     }
 
-    // Bad input is rejected, never executed.
     assert!(
         node.process("BOGUS")
             .await
@@ -295,14 +281,12 @@ async fn introspection_and_forward_validation_work_without_a_cluster() {
             .contains("STALE_EPOCH")
     );
 
-    // With no hops left a command must not be forwarded again.
     let exhausted = node.process("FORWARD 0 1 GET x").await;
     assert!(
         exhausted.contains("too many redirects") || exhausted.contains("no leader"),
         "unexpected response: {exhausted}"
     );
 
-    // Admin commands validate their arguments.
     assert!(node.process("GROUPINFO x").await.starts_with("-ERR"));
     assert!(node.process("GROUPOP 0 FLY 2").await.starts_with("-ERR"));
     assert!(
@@ -331,10 +315,6 @@ async fn each_server_hosts_exactly_the_partitions_the_table_assigns_it() {
     let _ = std::fs::remove_dir_all(data_dir);
 }
 
-/// Three real servers on localhost, several partitions, replication factor 2:
-/// every server holds only some partitions, so commands sent to *any* server
-/// must be routed to the right leader and the data must be readable through
-/// any other server.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_sharded_cluster_routes_every_key_to_its_partition() {
     let (configs, data_dir) = cluster_config("cluster", &[1, 2, 3], &[], 4, 2);
@@ -344,7 +324,6 @@ async fn a_sharded_cluster_routes_every_key_to_its_partition() {
     cluster.write_keys("user:", 0..40).await;
     cluster.assert_keys("user:", 0..40, &[1, 2, 3]).await;
 
-    // Keys really are spread over several partitions.
     let used: std::collections::BTreeSet<_> = (0..40)
         .map(|i| table.partition_of(&format!("user:{i}")))
         .collect();
@@ -353,7 +332,6 @@ async fn a_sharded_cluster_routes_every_key_to_its_partition() {
         "keys should spread over partitions: {used:?}"
     );
 
-    // DELETE works through a server that may not even host the partition.
     assert_eq!(
         ask_until_ok(&cluster.clients[2], "DELETE user:0").await,
         "+OK"
@@ -364,18 +342,14 @@ async fn a_sharded_cluster_routes_every_key_to_its_partition() {
     );
 }
 
-/// A server that missed a table update must not misroute: it is told it is
-/// stale, the two servers compare tables, and the older one adopts the newer.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_server_with_a_stale_routing_table_is_healed_on_contact() {
     let (configs, data_dir) = cluster_config("stale_epoch", &[1, 2, 3], &[], 4, 2);
     let table = configs[0].table.clone();
     let cluster = Cluster::start(configs, data_dir);
 
-    // Warm up: make sure leaders exist.
     cluster.write_keys("warm:", 0..8).await;
 
-    // Server 1 learns of epoch 2 (same placement); servers 2 and 3 do not.
     let newer = table.with_partition(0, table.replicas(0).to_vec(), 2);
     assert_eq!(
         ask(&cluster.clients[0], &format!("SETTABLE {}", newer.encode())).await,
@@ -384,8 +358,6 @@ async fn a_server_with_a_stale_routing_table_is_healed_on_contact() {
     assert_eq!(cluster.nodes[0].table().epoch, 2);
     assert_eq!(cluster.nodes[1].table().epoch, 1);
 
-    // Traffic through server 1 for partitions it does not host is forwarded
-    // with epoch 2, rejected by the others, and healed.
     cluster.write_keys("after:", 0..30).await;
     cluster.assert_keys("after:", 0..30, &[1, 2, 3]).await;
 
@@ -398,12 +370,8 @@ async fn a_server_with_a_stale_routing_table_is_healed_on_contact() {
     }
 }
 
-/// The headline V10 feature: add a server and later remove another, with
-/// every partition's data moving through Raft membership changes, while no
-/// key is ever lost.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn adding_and_removing_servers_moves_partitions_without_losing_data() {
-    // Servers 1-3 start with every partition (replication 3); 4 is a spare.
     let (configs, data_dir) = cluster_config("rebalance", &[1, 2, 3], &[4], 4, 3);
     let cluster = Cluster::start(configs, data_dir);
 
@@ -413,7 +381,6 @@ async fn adding_and_removing_servers_moves_partitions_without_losing_data() {
         "the spare holds nothing yet"
     );
 
-    // ---- add server 4 ----------------------------------------------------
     let response = tokio::time::timeout(
         Duration::from_secs(180),
         send_request(&cluster.clients[0], "REBALANCE 1,2,3,4"),
@@ -430,7 +397,6 @@ async fn adding_and_removing_servers_moves_partitions_without_losing_data() {
     let table = cluster.nodes[0].table();
     assert!(table.epoch > 1, "the epoch must advance");
 
-    // Every server agrees on the new table, and hosts exactly its partitions.
     for node in &cluster.nodes {
         assert_eq!(node.table().epoch, table.epoch);
         assert_eq!(node.hosted_partitions(), table.hosted_by(node.id()));
@@ -441,22 +407,18 @@ async fn adding_and_removing_servers_moves_partitions_without_losing_data() {
         "server 4 must now hold data"
     );
 
-    // Nothing was lost, the new replicas physically hold the old data, and
-    // the cluster still takes writes.
     cluster.assert_every_replica_holds("k", 0..30).await;
     cluster.assert_membership_matches_table().await;
     cluster.assert_keys("k", 0..30, &[1, 2, 3, 4]).await;
     cluster.write_keys("m", 0..20).await;
     cluster.assert_keys("m", 0..20, &[1, 2, 3, 4]).await;
 
-    // Running it again is a no-op.
     let again = ask(&cluster.clients[1], "REBALANCE 1,2,3,4").await;
     assert!(
         again.contains("already balanced"),
         "unexpected response: {again}"
     );
 
-    // ---- remove server 1 -------------------------------------------------
     let response = tokio::time::timeout(
         Duration::from_secs(180),
         send_request(&cluster.clients[2], "REBALANCE 2,3,4"),
@@ -482,8 +444,6 @@ async fn adding_and_removing_servers_moves_partitions_without_losing_data() {
         assert_eq!(node.hosted_partitions(), table.hosted_by(id));
     }
 
-    // Still no data lost, readable even through the departed server (it just
-    // forwards), and still writable.
     cluster.assert_every_replica_holds("k", 0..30).await;
     cluster.assert_every_replica_holds("m", 0..20).await;
     cluster.assert_membership_matches_table().await;
@@ -494,11 +454,6 @@ async fn adding_and_removing_servers_moves_partitions_without_losing_data() {
     cluster.assert_every_replica_holds("z", 0..10).await;
 }
 
-// ---------------------------------------------------------------------------
-// Cross-partition transactions
-// ---------------------------------------------------------------------------
-
-/// Keys that land in `count` different partitions, in partition order.
 fn keys_in_distinct_partitions(table: &RoutingTable, count: usize) -> Vec<(String, PartitionId)> {
     let mut found: std::collections::BTreeMap<PartitionId, String> = Default::default();
 
@@ -525,7 +480,6 @@ fn put(key: &str, value: &str) -> TxnOp {
 }
 
 impl Cluster {
-    /// Whichever server currently leads `partition`.
     async fn leader_group(&self, partition: PartitionId) -> Arc<RaftServer> {
         let deadline = Instant::now() + Duration::from_secs(30);
 
@@ -546,8 +500,6 @@ impl Cluster {
         }
     }
 
-    /// Run a protocol step by hand, as a coordinator that may "crash" between
-    /// steps would have.
     async fn step(&self, partition: PartitionId, step: TxnCommand) -> String {
         let deadline = Instant::now() + Duration::from_secs(20);
 
@@ -563,8 +515,6 @@ impl Cluster {
         }
     }
 
-    /// Wait for `key` to read `expected` through server `via` (a value
-    /// appearing, or disappearing, is how recovery shows up to a client).
     async fn eventually(&self, via: usize, key: &str, expected: &str) {
         let deadline = Instant::now() + Duration::from_secs(20);
 
@@ -597,7 +547,6 @@ async fn a_transaction_writes_several_partitions_atomically() {
     cluster.write_keys("warm", 0..4).await;
     ask_until_ok(&cluster.clients[0], &format!("SET {} old", keys[2].0)).await;
 
-    // Three partitions, one atomic commit (including a delete).
     let request = format!(
         "TXN SET {} one ; SET {} two ; DELETE {}",
         keys[0].0, keys[1].0, keys[2].0
@@ -610,8 +559,6 @@ async fn a_transaction_writes_several_partitions_atomically() {
         cluster.eventually(via, &keys[2].0, "$-1\r\n").await;
     }
 
-    // Locks were released: the same keys can be written by another
-    // transaction, and by plain writes.
     let again = format!("TXN SET {} uno ; SET {} dos", keys[0].0, keys[1].0);
     assert_eq!(ask_until_ok(&cluster.clients[1], &again).await, "+OK");
     cluster.eventually(2, &keys[0].0, &bulk("uno")).await;
@@ -620,7 +567,6 @@ async fn a_transaction_writes_several_partitions_atomically() {
         "+OK"
     );
 
-    // Bad input never reaches Raft.
     assert!(
         ask(&cluster.clients[0], "TXN GET a")
             .await
@@ -637,7 +583,6 @@ async fn a_transaction_writes_several_partitions_atomically() {
 async fn a_conflicting_transaction_aborts_and_leaves_no_trace() {
     let (configs, data_dir) = cluster_config("txn_conflict", &[1, 2, 3], &[], 4, 3);
     let table = configs[0].table.clone();
-    // The holder must stay open for the whole test: recovery may not touch it.
     let configs = with_txn_timeout(configs, Duration::from_secs(300));
     let cluster = Cluster::start(configs, data_dir);
 
@@ -645,7 +590,6 @@ async fn a_conflicting_transaction_aborts_and_leaves_no_trace() {
     let (locked, locked_partition) = (&keys[0].0, keys[0].1);
     let (other, _) = (&keys[1].0, keys[1].1);
 
-    // Another transaction has prepared (locked) `locked` and is still open.
     let vote = cluster
         .step(
             locked_partition,
@@ -659,7 +603,6 @@ async fn a_conflicting_transaction_aborts_and_leaves_no_trace() {
         .await;
     assert_eq!(vote, "YES");
 
-    // A rival that needs `locked` plus an unrelated key must abort entirely.
     let rival = format!("TXN SET {other} should-not-appear ; SET {locked} rival");
     let response = ask_until_ok(&cluster.clients[0], &rival).await;
 
@@ -676,8 +619,6 @@ async fn a_conflicting_transaction_aborts_and_leaves_no_trace() {
         "$-1\r\n"
     );
 
-    // Release the holder; now the same rival succeeds (its aborted attempt
-    // left nothing behind).
     cluster
         .step(
             locked_partition,
@@ -695,8 +636,6 @@ async fn a_conflicting_transaction_aborts_and_leaves_no_trace() {
     cluster.eventually(2, locked, &bulk("rival")).await;
 }
 
-/// The coordinator recorded COMMIT and then "died" before phase 2. Nothing
-/// is applied yet and the keys are locked; recovery must finish the commit.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn recovery_completes_a_transaction_whose_coordinator_died_after_deciding() {
     let (configs, data_dir) = cluster_config("txn_recover_commit", &[1, 2, 3], &[], 4, 3);
@@ -708,8 +647,6 @@ async fn recovery_completes_a_transaction_whose_coordinator_died_after_deciding(
     let participants: Vec<PartitionId> = keys.iter().map(|(_, partition)| *partition).collect();
     let coordinator = participants[0];
 
-    // Let every partition elect a leader first, so the hand-driven steps
-    // below run well inside the recovery timeout.
     for (_, partition) in &keys {
         cluster.leader_group(*partition).await;
     }
@@ -729,8 +666,6 @@ async fn recovery_completes_a_transaction_whose_coordinator_died_after_deciding(
         assert_eq!(vote, "YES");
     }
 
-    // The commit point: the decision is durable, but nobody tells the
-    // participants. Their keys are still locked and unwritten.
     let decision = cluster
         .step(
             coordinator,
@@ -742,20 +677,16 @@ async fn recovery_completes_a_transaction_whose_coordinator_died_after_deciding(
         .await;
     assert_eq!(decision, "COMMIT");
 
-    // Recovery reads the decision and finishes it on every participant.
     for (key, _) in &keys {
         cluster
             .eventually(1, key, &bulk("committed-by-recovery"))
             .await;
     }
 
-    // ...and the locks are gone.
     let next = format!("TXN SET {} again ; SET {} again", keys[0].0, keys[1].0);
     assert_eq!(ask_until_ok(&cluster.clients[2], &next).await, "+OK");
 }
 
-/// The coordinator died before deciding anything. Recovery must abort (first
-/// decision wins) and a late attempt to commit must lose.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn recovery_aborts_an_undecided_transaction_and_a_late_commit_loses() {
     let (configs, data_dir) = cluster_config("txn_recover_abort", &[1, 2, 3], &[], 4, 3);
@@ -767,8 +698,6 @@ async fn recovery_aborts_an_undecided_transaction_and_a_late_commit_loses() {
     let participants: Vec<PartitionId> = keys.iter().map(|(_, partition)| *partition).collect();
     let coordinator = participants[0];
 
-    // Let every partition elect a leader first, so the hand-driven steps
-    // below run well inside the recovery timeout.
     for (_, partition) in &keys {
         cluster.leader_group(*partition).await;
     }
@@ -788,15 +717,11 @@ async fn recovery_aborts_an_undecided_transaction_and_a_late_commit_loses() {
         assert_eq!(vote, "YES");
     }
 
-    // No decision is ever sent. After the timeout recovery decides ABORT and
-    // releases the locks: a new transaction on the same keys goes through.
     let next = format!("TXN SET {} fresh ; SET {} fresh", keys[0].0, keys[1].0);
     assert_eq!(ask_until_ok(&cluster.clients[0], &next).await, "+OK");
     cluster.eventually(1, &keys[0].0, &bulk("fresh")).await;
     cluster.eventually(2, &keys[1].0, &bulk("fresh")).await;
 
-    // The original coordinator wakes up late and tries to commit: it is told
-    // the transaction was already aborted.
     let late = cluster
         .step(
             coordinator,
@@ -807,4 +732,509 @@ async fn recovery_aborts_an_undecided_transaction_and_a_late_commit_loses() {
         )
         .await;
     assert_eq!(late, "ABORT", "the first decision must win");
+}
+
+fn with_limits(
+    mut configs: Vec<ShardConfig>,
+    max_connections: usize,
+    max_pending_writes: usize,
+) -> Vec<ShardConfig> {
+    for config in &mut configs {
+        config.max_connections = max_connections;
+        config.max_pending_writes = max_pending_writes;
+    }
+
+    configs
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_retried_request_is_applied_once_whichever_server_it_reaches() {
+    let (configs, data_dir) = cluster_config("v11_once", &[1, 2, 3], &[], 4, 3);
+    let cluster = Cluster::start(configs, data_dir);
+
+    for via in 0..3 {
+        let reply = ask_until_ok(&cluster.clients[via], "REQ client-a 1 INCR hits").await;
+        assert_eq!(reply, bulk("1"), "attempt via server {via}");
+    }
+
+    assert_eq!(
+        ask_until_ok(&cluster.clients[0], "GET hits").await,
+        bulk("1")
+    );
+
+    assert_eq!(
+        ask_until_ok(&cluster.clients[1], "REQ client-a 2 INCR hits").await,
+        bulk("2")
+    );
+
+    assert_eq!(
+        ask_until_ok(&cluster.clients[2], "REQ client-b 1 INCR hits").await,
+        bulk("3")
+    );
+
+    let stale = ask(&cluster.clients[0], "REQ client-a 1 INCR hits").await;
+    assert!(stale.contains("stale") || stale == bulk("1"), "{stale}");
+    assert_eq!(
+        ask_until_ok(&cluster.clients[0], "GET hits").await,
+        bulk("3")
+    );
+
+    assert!(
+        ask(&cluster.clients[0], "INCR hits")
+            .await
+            .contains("request id")
+    );
+
+    assert!(
+        ask(&cluster.clients[0], "REQ c SET a b")
+            .await
+            .starts_with("-ERR")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_retried_set_does_not_undo_someone_elses_newer_write() {
+    let (configs, data_dir) = cluster_config("v11_lost_update", &[1, 2, 3], &[], 4, 3);
+    let cluster = Cluster::start(configs, data_dir);
+
+    assert_eq!(
+        ask_until_ok(&cluster.clients[0], "REQ a 1 SET shared first").await,
+        "+OK"
+    );
+    assert_eq!(
+        ask_until_ok(&cluster.clients[1], "REQ b 1 SET shared second").await,
+        "+OK"
+    );
+
+    assert_eq!(
+        ask_until_ok(&cluster.clients[2], "REQ a 1 SET shared first").await,
+        "+OK",
+        "the retry reports the original success"
+    );
+
+    assert_eq!(
+        ask_until_ok(&cluster.clients[0], "GET shared").await,
+        bulk("second"),
+        "B's newer write must survive A's retry"
+    );
+
+    ask_until_ok(&cluster.clients[0], "SET plain first").await;
+    ask_until_ok(&cluster.clients[0], "SET plain second").await;
+    ask_until_ok(&cluster.clients[0], "SET plain first").await;
+    assert_eq!(
+        ask_until_ok(&cluster.clients[0], "GET plain").await,
+        bulk("first")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_retried_transaction_does_not_run_its_writes_again() {
+    let (configs, data_dir) = cluster_config("v11_txn_retry", &[1, 2, 3], &[], 4, 3);
+    let table = configs[0].table.clone();
+    let cluster = Cluster::start(configs, data_dir);
+
+    let keys = keys_in_distinct_partitions(&table, 2);
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut number = 0;
+
+    let request = loop {
+        number += 1;
+        let request = format!(
+            "REQ t1 {number} TXN SET {} one ; SET {} two",
+            keys[0].0, keys[1].0
+        );
+
+        let reply = ask(&cluster.clients[0], &request).await;
+
+        if reply == "+OK" {
+            break request;
+        }
+
+        assert!(
+            Instant::now() < deadline,
+            "transaction never committed: {reply}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+
+    cluster.eventually(1, &keys[0].0, &bulk("one")).await;
+    cluster.eventually(2, &keys[1].0, &bulk("two")).await;
+
+    assert_eq!(
+        ask_until_ok(&cluster.clients[0], &format!("SET {} changed", keys[0].0)).await,
+        "+OK"
+    );
+
+    assert_eq!(ask_until_ok(&cluster.clients[1], &request).await, "+OK");
+
+    cluster.eventually(2, &keys[0].0, &bulk("changed")).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_session_table_survives_log_compaction() {
+    let (mut configs, data_dir) = cluster_config("v11_compaction", &[1, 2, 3], &[], 1, 3);
+    for config in &mut configs {
+        config.snapshot_threshold = Some(5);
+    }
+    let cluster = Cluster::start(configs, data_dir);
+
+    assert_eq!(
+        ask_until_ok(&cluster.clients[0], "REQ keeper 1 INCR hits").await,
+        bulk("1")
+    );
+
+    for i in 0..40 {
+        let reply = ask_until_ok(
+            &cluster.clients[0],
+            &format!("REQ filler {} SET f v{i}", i + 1),
+        )
+        .await;
+        assert_eq!(reply, "+OK");
+    }
+
+    assert_eq!(
+        ask_until_ok(&cluster.clients[1], "REQ keeper 1 INCR hits").await,
+        bulk("1")
+    );
+    assert_eq!(
+        ask_until_ok(&cluster.clients[2], "GET hits").await,
+        bulk("1")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn writes_beyond_the_limit_are_refused_with_busy_and_not_applied() {
+    let (configs, data_dir) = cluster_config("v11_busy_writes", &[1, 2, 3], &[], 4, 3);
+    let configs = with_limits(configs, 1024, 0);
+    let cluster = Cluster::start(configs, data_dir);
+
+    let busy_before = crate::metrics::counter_value("writes_rejected_total", &[("reason", "busy")]);
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let reply = ask(&cluster.clients[0], "GET k").await;
+        if !reply.starts_with("-ERR") || Instant::now() > deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    let reply = ask(&cluster.clients[0], "SET k v").await;
+    assert!(reply.starts_with("-ERR BUSY"), "{reply}");
+
+    let reply = ask(&cluster.clients[1], "REQ c 1 SET k v").await;
+    assert!(reply.contains("BUSY"), "{reply}");
+
+    assert_eq!(ask(&cluster.clients[2], "GET k").await, "$-1\r\n");
+
+    assert!(
+        crate::metrics::counter_value("writes_rejected_total", &[("reason", "busy")]) > busy_before
+    );
+}
+
+async fn open_held_connection(address: &str) -> tokio::net::TcpStream {
+    use crate::net::framing::{FrameDecoder, encode_frame};
+    use crate::raft::server::read_frame;
+    use tokio::io::AsyncWriteExt;
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+
+    loop {
+        let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        stream
+            .write_all(&encode_frame(b"STATUS").unwrap())
+            .await
+            .unwrap();
+
+        let mut decoder = FrameDecoder::new();
+        let reply = read_frame(&mut stream, &mut decoder)
+            .await
+            .unwrap()
+            .unwrap();
+
+        if !String::from_utf8_lossy(&reply).starts_with("-ERR BUSY") {
+            return stream;
+        }
+
+        assert!(Instant::now() < deadline, "could not get a connection slot");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn connections_beyond_the_limit_get_busy_and_capacity_returns() {
+    let (configs, data_dir) = cluster_config("v11_busy_conns", &[1, 2, 3], &[], 4, 3);
+    let configs = with_limits(configs, 2, 1024);
+    let cluster = Cluster::start(configs, data_dir);
+
+    ask_until_ok(&cluster.clients[0], "SET warm up").await;
+
+    let first = open_held_connection(&cluster.clients[0]).await;
+    let second = open_held_connection(&cluster.clients[0]).await;
+
+    let rejected_before = crate::metrics::counter_value("connections_rejected_total", &[]);
+
+    let reply = ask(&cluster.clients[0], "GET warm").await;
+    assert!(reply.starts_with("-ERR BUSY"), "{reply}");
+    assert!(crate::metrics::counter_value("connections_rejected_total", &[]) > rejected_before);
+
+    drop(first);
+    drop(second);
+
+    assert_eq!(
+        ask_until_ok(&cluster.clients[0], "GET warm").await,
+        bulk("up")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn requests_and_dedup_hits_show_up_in_the_metrics() {
+    let (configs, data_dir) = cluster_config("v11_metrics", &[1, 2, 3], &[], 4, 3);
+    let cluster = Cluster::start(configs, data_dir);
+
+    let ok_before = crate::metrics::counter_value("requests_total", &[("outcome", "ok")]);
+    let dup_before = crate::metrics::counter_value("session_retries_answered_total", &[]);
+
+    ask_until_ok(&cluster.clients[0], "REQ m 1 INCR n").await;
+    ask_until_ok(&cluster.clients[0], "REQ m 1 INCR n").await;
+    ask_until_ok(&cluster.clients[0], "GET n").await;
+
+    assert!(crate::metrics::counter_value("requests_total", &[("outcome", "ok")]) >= ok_before + 3);
+    assert!(crate::metrics::counter_value("session_retries_answered_total", &[]) > dup_before);
+    assert!(crate::metrics::histogram_count("request_seconds", &[("outcome", "ok")]) > 0);
+
+    let text = crate::metrics::render();
+    assert!(text.contains("raft_commit_seconds_bucket"));
+    assert!(text.contains("raft_log_fsync_seconds_bucket"));
+    assert!(text.contains("wal_fsync_seconds_bucket"));
+}
+
+fn make_test_certs(name: &str) -> Option<PathBuf> {
+    let dir = temp_dir(name);
+    let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/gen-certs.sh");
+
+    let status = std::process::Command::new("sh")
+        .arg(script)
+        .arg(&dir)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .ok()?;
+
+    status.success().then_some(dir)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_secured_cluster_requires_the_token_and_encrypts_every_connection() {
+    use crate::net::security::{Security, TlsFiles};
+    use crate::shard::node::send_request_with;
+
+    let Some(certs) = make_test_certs("secured_certs") else {
+        eprintln!("openssl not available: skipping the secured-cluster test");
+        return;
+    };
+
+    let (mut configs, data_dir) = cluster_config("secured", &[1, 2, 3], &[], 4, 3);
+
+    let security = Security::new(
+        Some("correct-horse".to_string()),
+        Some(TlsFiles {
+            cert: &certs.join("server.pem"),
+            key: &certs.join("server.key"),
+            ca: &certs.join("ca.pem"),
+        }),
+    )
+    .unwrap();
+
+    for config in &mut configs {
+        config.security = std::sync::Arc::clone(&security);
+    }
+
+    let cluster = Cluster::start(configs, data_dir);
+
+    let secure = |address: String, request: String| {
+        let security = std::sync::Arc::clone(&security);
+
+        async move {
+            let deadline = Instant::now() + Duration::from_secs(30);
+
+            loop {
+                let reply = send_request_with(&security, &address, &request)
+                    .await
+                    .unwrap_or_else(|error| format!("-ERR {error}"));
+
+                if !reply.starts_with("-ERR") || Instant::now() >= deadline {
+                    return reply;
+                }
+
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+    };
+
+    for i in 0..8 {
+        let reply = secure(
+            cluster.clients[i % 3].clone(),
+            format!("REQ me {} SET key{i} value{i}", i + 1),
+        )
+        .await;
+        assert_eq!(reply, "+OK", "SET key{i}");
+    }
+
+    for i in 0..8 {
+        for via in 0..3 {
+            let reply = secure(cluster.clients[via].clone(), format!("GET key{i}")).await;
+            assert_eq!(
+                reply,
+                bulk(&format!("value{i}")),
+                "GET key{i} via server {via}"
+            );
+        }
+    }
+
+    assert!(
+        send_request(&cluster.clients[0], "GET key0").await.is_err(),
+        "a plaintext client must not be served"
+    );
+
+    let wrong = Security::new(
+        Some("wrong".to_string()),
+        Some(TlsFiles {
+            cert: &certs.join("server.pem"),
+            key: &certs.join("server.key"),
+            ca: &certs.join("ca.pem"),
+        }),
+    )
+    .unwrap();
+
+    let error = send_request_with(&wrong, &cluster.clients[0], "GET key0")
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+
+    let tls_only = Security::new(
+        None,
+        Some(TlsFiles {
+            cert: &certs.join("server.pem"),
+            key: &certs.join("server.key"),
+            ca: &certs.join("ca.pem"),
+        }),
+    )
+    .unwrap();
+
+    let reply = send_request_with(&tls_only, &cluster.clients[0], "GET key0")
+        .await
+        .unwrap();
+    assert!(reply.contains("NOAUTH"), "{reply}");
+
+    let _ = std::fs::remove_dir_all(certs);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_token_alone_protects_a_cluster_without_tls() {
+    use crate::net::security::Security;
+    use crate::shard::node::send_request_with;
+
+    let (mut configs, data_dir) = cluster_config("token_only", &[1, 2, 3], &[], 4, 3);
+    let security = Security::new(Some("s3cret".to_string()), None).unwrap();
+
+    for config in &mut configs {
+        config.security = std::sync::Arc::clone(&security);
+    }
+
+    let cluster = Cluster::start(configs, data_dir);
+    let deadline = Instant::now() + Duration::from_secs(30);
+
+    loop {
+        let reply = send_request_with(&security, &cluster.clients[0], "SET a 1")
+            .await
+            .unwrap_or_else(|error| format!("-ERR {error}"));
+
+        if reply == "+OK" {
+            break;
+        }
+
+        assert!(Instant::now() < deadline, "never became writable: {reply}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    let anonymous = send_request(&cluster.clients[1], "GET a").await.unwrap();
+    assert!(anonymous.contains("NOAUTH"), "{anonymous}");
+
+    let allowed = send_request_with(&security, &cluster.clients[2], "GET a")
+        .await
+        .unwrap();
+    assert_eq!(allowed, bulk("1"));
+
+    let wrong = Security::new(Some("nope".to_string()), None).unwrap();
+    assert!(
+        send_request_with(&wrong, &cluster.clients[1], "GET a")
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_peer_port_ignores_unauthenticated_raft_messages() {
+    use crate::net::framing::{FrameDecoder, encode_frame};
+    use crate::net::security::Security;
+    use crate::raft::rpc::{RaftMessage, encode_envelope};
+    use crate::raft::server::read_frame;
+    use crate::raft::types::RequestVoteArgs;
+    use tokio::io::AsyncWriteExt;
+
+    let (mut configs, data_dir) = cluster_config("peer_auth", &[1, 2, 3], &[], 4, 3);
+    let peer_address = configs[0].servers[&1].peer.clone();
+    let security = Security::new(Some("s3cret".to_string()), None).unwrap();
+
+    for config in &mut configs {
+        config.security = std::sync::Arc::clone(&security);
+    }
+
+    let _cluster = Cluster::start(configs, data_dir);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let vote = encode_frame(
+        &encode_envelope(
+            0,
+            &RaftMessage::RequestVote(RequestVoteArgs {
+                term: 0,
+                candidate_id: 9,
+                last_log_index: 0,
+                last_log_term: 0,
+            }),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+
+    let mut stream = tokio::net::TcpStream::connect(&peer_address).await.unwrap();
+    stream.write_all(&vote).await.unwrap();
+    let mut decoder = FrameDecoder::new();
+    let answer = read_frame(&mut stream, &mut decoder).await;
+    assert!(
+        !matches!(answer, Ok(Some(_))),
+        "an unauthenticated peer must get no reply"
+    );
+
+    let mut stream = tokio::net::TcpStream::connect(&peer_address).await.unwrap();
+    stream
+        .write_all(&encode_frame(b"AUTH nope").unwrap())
+        .await
+        .unwrap();
+    stream.write_all(&vote).await.unwrap();
+    let mut decoder = FrameDecoder::new();
+    let answer = read_frame(&mut stream, &mut decoder).await;
+    assert!(!matches!(answer, Ok(Some(_))));
+
+    let mut stream = tokio::net::TcpStream::connect(&peer_address).await.unwrap();
+    stream
+        .write_all(&encode_frame(b"AUTH s3cret").unwrap())
+        .await
+        .unwrap();
+    stream.write_all(&vote).await.unwrap();
+    let mut decoder = FrameDecoder::new();
+    let answer = read_frame(&mut stream, &mut decoder).await.unwrap();
+    assert!(answer.is_some(), "an authenticated peer must get a reply");
 }

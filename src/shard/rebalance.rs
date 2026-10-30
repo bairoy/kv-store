@@ -1,27 +1,4 @@
 //! Moving partitions between servers while the cluster keeps serving traffic.
-//!
-//! "Assignment is not data movement": changing the routing table does not
-//! move any data. A partition's data only moves when its Raft group changes
-//! *members*, and that is done with the single-server membership changes from
-//! `raft::node`. For every partition whose replica set must change, the
-//! coordinator (whichever server received `REBALANCE`) does this, in order:
-//!
-//! ```text
-//! for each server joining the partition:
-//!     1. HOST p            the server starts an empty Raft group for p
-//!     2. ADD_LEARNER       the leader starts sending it the log / a snapshot
-//!     3. wait              until the learner has (almost) caught up
-//!     4. PROMOTE           the learner becomes a voter
-//! for each server leaving the partition:
-//!     5. REMOVE            it leaves the group (committed by Raft)
-//!     6. UNHOST p          it stops its group and sets the data aside
-//! 7. publish the routing table with this partition updated and epoch + 1
-//! ```
-//!
-//! The table is flipped only after step 6, one partition at a time, with a
-//! pause in between so the data transfer does not starve live traffic. Every
-//! step first looks at the group's current state, so if the coordinator dies
-//! half way, running the same `REBALANCE` again simply finishes the job.
 
 use std::time::{Duration, Instant};
 
@@ -35,12 +12,10 @@ use crate::shard::routing::{PartitionId, PartitionMove, RoutingTable};
 
 const LEADER_WAIT: Duration = Duration::from_secs(30);
 const CATCH_UP_WAIT: Duration = Duration::from_secs(120);
-/// A learner may be promoted once it lacks at most this many committed entries.
 const CATCH_UP_LAG: u64 = 2;
 const RETRY_PAUSE: Duration = Duration::from_millis(100);
 const MAX_ATTEMPTS: usize = 60;
 
-/// What a server reported for one partition (`GROUPINFO`).
 #[derive(Debug)]
 pub(crate) struct GroupState {
     is_leader: bool,
@@ -78,7 +53,6 @@ impl GroupState {
     }
 }
 
-/// What a membership step is trying to achieve.
 #[derive(Debug, Clone, Copy)]
 enum Goal {
     Learner,
@@ -87,7 +61,6 @@ enum Goal {
 }
 
 impl ShardNode {
-    /// `REBALANCE <ids>`: make exactly these servers hold the data.
     pub(crate) async fn rebalance(&self, servers: &str) -> String {
         match self.rebalance_to(servers).await {
             Ok(message) => encode_response(Response::Value(message)),
@@ -131,7 +104,7 @@ impl ShardNode {
             ));
         }
 
-        println!(
+        tracing::info!(
             "Rebalance: {} of {} partitions change replicas",
             moves.len(),
             current.partition_count()
@@ -140,14 +113,15 @@ impl ShardNode {
         let mut table = (*current).clone();
 
         for change in &moves {
-            println!(
+            tracing::info!(
                 "Rebalance: partition {} adds {:?}, removes {:?}",
-                change.partition, change.add, change.remove
+                change.partition,
+                change.add,
+                change.remove
             );
 
             self.move_partition(&table, change).await?;
 
-            // The data is in place: now (and only now) flip the routing.
             table = table.with_partition(
                 change.partition,
                 ideal.replicas(change.partition).to_vec(),
@@ -156,7 +130,6 @@ impl ShardNode {
 
             self.publish_table(&table).await;
 
-            // Throttle: leave room for foreground traffic.
             sleep(self.rebalance_pause).await;
         }
 
@@ -167,7 +140,6 @@ impl ShardNode {
         ))
     }
 
-    /// Steps 1-6 for one partition.
     async fn move_partition(
         &self,
         table: &RoutingTable,
@@ -198,8 +170,6 @@ impl ShardNode {
             self.ensure(partition, &candidates, leaving, Goal::Gone)
                 .await?;
 
-            // Best effort: the server may be down, in which case it simply
-            // keeps an idle group that nobody talks to.
             let _ = self
                 .ask_server(leaving, &format!("UNHOST {partition}"))
                 .await;
@@ -208,19 +178,16 @@ impl ShardNode {
         Ok(())
     }
 
-    /// Send the new table to every server (this one included).
     async fn publish_table(&self, table: &RoutingTable) {
         if let Err(error) = self.adopt_table(table.clone()) {
-            eprintln!("Rebalance: could not save the routing table locally: {error}");
+            tracing::warn!("Rebalance: could not save the routing table locally: {error}");
         }
 
         let command = format!("SETTABLE {}", table.encode());
 
         for server in self.servers.keys().filter(|server| **server != self.id) {
-            // A server that is down misses this; it catches up from a peer
-            // the next time they talk (see `sync_table_with`).
             if let Err(error) = self.ask_server(*server, &command).await {
-                eprintln!(
+                tracing::warn!(
                     "Rebalance: could not tell server {server} about epoch {}: {error}",
                     table.epoch
                 );
@@ -240,7 +207,6 @@ impl ShardNode {
         }
     }
 
-    /// Find whichever candidate currently leads the partition.
     pub(crate) async fn find_leader(
         &self,
         partition: PartitionId,
@@ -271,9 +237,6 @@ impl ShardNode {
         }
     }
 
-    /// Repeat one membership change until the group reflects it. Leaders come
-    /// and go and a change may be refused (another in flight, no committed
-    /// entry in this term yet), so each attempt re-reads the real state.
     async fn ensure(
         &self,
         partition: PartitionId,
@@ -302,7 +265,6 @@ impl ShardNode {
 
             let command = format!("GROUPOP {partition} {operation} {server}");
 
-            // The leader answers +OK only once the change is committed.
             if let Ok(response) = self.ask_server(leader, &command).await
                 && response == "+OK"
             {
@@ -317,7 +279,6 @@ impl ShardNode {
         ))
     }
 
-    /// Wait until the learner lacks at most `CATCH_UP_LAG` committed entries.
     async fn wait_until_caught_up(
         &self,
         partition: PartitionId,
