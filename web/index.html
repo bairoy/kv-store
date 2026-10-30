@@ -3,174 +3,381 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>kv-store live cluster</title>
+<meta name="color-scheme" content="light">
+<meta name="description" content="A replicated, sharded key-value database with Raft consensus, running live.">
+<title>kv-store · live cluster</title>
 <style>
-:root{--bg:#f6f7f9;--card:#fff;--ink:#1b1f24;--muted:#5d6672;--line:#e1e5ea;--accent:#2457d6;--ok:#157f4a;--warn:#b26a00;--bad:#c4302b;--leader:#157f4a;--follower:#2457d6;--cand:#b26a00;--down:#c4302b}
-@media (prefers-color-scheme:dark){:root{--bg:#0f1318;--card:#171c23;--ink:#e8ecf1;--muted:#94a0ae;--line:#2a323c;--accent:#6b97ff;--ok:#43c37c;--warn:#e6a23c;--bad:#ff6b66;--leader:#43c37c;--follower:#6b97ff;--cand:#e6a23c;--down:#ff6b66}}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
-main{max-width:1000px;margin:0 auto;padding:24px 16px 64px}
-h1{font-size:1.6rem;margin:0 0 4px}h2{font-size:1.1rem;margin:0 0 12px}p{margin:0 0 10px}
-.sub{color:var(--muted);margin-bottom:20px}
-.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px;margin-bottom:16px}
-.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
-.servers{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px}
-.server{border:1px solid var(--line);border-radius:10px;padding:10px}
-.server b{display:block}.badge{display:inline-block;font-size:.75rem;padding:1px 8px;border-radius:99px;border:1px solid currentColor}
-.running{color:var(--ok)}.down,.restarting{color:var(--down)}
-table{border-collapse:collapse;width:100%;font-size:.9rem}th,td{padding:5px 8px;text-align:center;border-bottom:1px solid var(--line)}
-th:first-child,td:first-child{text-align:left}
-.c{display:inline-block;min-width:26px;border-radius:6px;font-weight:600;font-size:.8rem;padding:1px 0}
-.L{background:var(--leader);color:#fff}.F{background:transparent;border:1px solid var(--follower);color:var(--follower)}
-.C{background:var(--cand);color:#fff}.x{background:var(--down);color:#fff}.dash{color:var(--muted)}
-.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-top:12px}
-.stat{border:1px solid var(--line);border-radius:10px;padding:8px 10px}.stat span{display:block;color:var(--muted);font-size:.8rem}.stat b{font-size:1.2rem}
-input,button{font:inherit;padding:8px 10px;border-radius:8px;border:1px solid var(--line);background:var(--card);color:var(--ink)}
-input{min-width:0;flex:1 1 140px}
-button{cursor:pointer;background:var(--accent);color:#fff;border-color:var(--accent)}button.secondary{background:var(--card);color:var(--ink);border-color:var(--line)}
-button.danger{background:var(--down);border-color:var(--down)}button:disabled{opacity:.5;cursor:not-allowed}
-pre{background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:10px;overflow:auto;font-size:.85rem;margin:10px 0 0;white-space:pre-wrap}
-.events{list-style:none;padding:0;margin:10px 0 0;font-size:.9rem;color:var(--muted)}.events li{padding:2px 0}
-.legend{color:var(--muted);font-size:.85rem;margin-top:8px}
-ol,ul.how{margin:0;padding-left:20px}.how li{margin-bottom:6px}
-.note{color:var(--muted);font-size:.85rem}
-a{color:var(--accent)}
+:root{
+  --bg:#ffffff; --band:#f8fafc; --line:#e5e7eb; --line-strong:#d1d5db;
+  --ink:#0f172a; --ink-2:#334155; --muted:#64748b;
+  --accent:#4f46e5; --accent-hover:#4338ca; --accent-soft:#eef2ff;
+  --ok:#15803d; --ok-soft:#ecfdf3; --warn:#b45309; --warn-soft:#fffbeb; --bad:#b91c1c; --bad-soft:#fef2f2;
+  --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  --radius:12px;
+}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth;-webkit-text-size-adjust:100%}
+@media (prefers-reduced-motion:reduce){html{scroll-behavior:auto}}
+body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.6 system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;-webkit-font-smoothing:antialiased}
+h1,h2,h3,h4,p{margin:0}
+button,input{font:inherit;color:inherit}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-radius:6px}
+.wrap{max-width:1080px;margin:0 auto;padding:0 24px}
+
+/* navigation */
+.nav{position:sticky;top:0;z-index:10;background:rgba(255,255,255,.92);backdrop-filter:blur(8px);border-bottom:1px solid var(--line)}
+.nav .wrap{display:flex;align-items:center;justify-content:space-between;height:60px;gap:16px}
+.brand{display:flex;align-items:center;gap:10px;font-weight:700;font-size:17px;letter-spacing:-.02em;color:var(--ink);text-decoration:none}
+.brand svg{width:24px;height:24px;color:var(--accent)}
+.links{display:flex;align-items:center;gap:24px}
+.links a{color:var(--ink-2);text-decoration:none;font-size:14.5px;font-weight:500}
+.links a:hover{color:var(--accent)}
+@media (max-width:700px){.links a{display:none}}
+.pill{display:inline-flex;align-items:center;gap:8px;border:1px solid var(--line);border-radius:999px;padding:5px 13px;font-size:13px;font-weight:500;color:var(--ink-2);white-space:nowrap;background:#fff}
+.dot{width:8px;height:8px;border-radius:50%;background:var(--line-strong);flex:none}
+.dot.ok{background:var(--ok)}.dot.warn{background:var(--warn)}.dot.bad{background:var(--bad)}
+
+/* hero */
+.hero{padding:88px 0 64px;text-align:center}
+.hero h1{font-size:clamp(34px,6vw,56px);line-height:1.08;letter-spacing:-.035em;font-weight:750;max-width:760px;margin:0 auto}
+.hero p{margin:20px auto 0;color:var(--muted);font-size:clamp(17px,2vw,20px);max-width:560px}
+.cta{display:flex;justify-content:center;gap:12px;margin-top:32px;flex-wrap:wrap}
+.facts{display:flex;justify-content:center;gap:40px;margin-top:56px;flex-wrap:wrap}
+.fact b{display:block;font-size:28px;letter-spacing:-.02em;font-weight:700}
+.fact span{color:var(--muted);font-size:14px}
+
+/* sections */
+section{padding:64px 0;border-top:1px solid var(--line)}
+section.band{background:var(--band)}
+.head{margin-bottom:28px}
+.head h2{font-size:28px;letter-spacing:-.025em;font-weight:700}
+.head p{color:var(--muted);margin-top:6px}
+.head .meta{display:block;color:var(--muted);font-size:13px;margin-top:6px}
+
+/* buttons and inputs */
+.btn{display:inline-flex;align-items:center;justify-content:center;cursor:pointer;border:1px solid var(--accent);background:var(--accent);color:#fff;padding:10px 18px;border-radius:9px;font-weight:600;font-size:15px;text-decoration:none;transition:background .15s,border-color .15s}
+.btn:hover:not(:disabled){background:var(--accent-hover);border-color:var(--accent-hover)}
+.btn.ghost{background:#fff;color:var(--ink);border-color:var(--line-strong)}
+.btn.ghost:hover:not(:disabled){background:var(--band);border-color:var(--line-strong)}
+.btn.danger{background:#fff;color:var(--bad);border-color:#fca5a5}
+.btn.danger:hover:not(:disabled){background:var(--bad-soft);border-color:#fca5a5}
+.btn.small{padding:7px 13px;font-size:14px}
+.btn:disabled{opacity:.45;cursor:not-allowed}
+.btn.busy{position:relative;color:transparent}
+.btn.busy::after{content:"";position:absolute;inset:0;margin:auto;width:15px;height:15px;border-radius:50%;border:2px solid #fff;border-right-color:transparent;animation:spin .7s linear infinite}
+.btn.ghost.busy::after,.btn.danger.busy::after{border-color:var(--ink);border-right-color:transparent}
+@keyframes spin{to{transform:rotate(360deg)}}
+@media (prefers-reduced-motion:reduce){.btn.busy::after{animation:none}}
+input{flex:1 1 130px;min-width:0;background:#fff;border:1px solid var(--line-strong);border-radius:9px;padding:9px 12px}
+input:focus{border-color:var(--accent)}
+input::placeholder{color:#94a3b8}
+
+/* cards */
+.card{background:#fff;border:1px solid var(--line);border-radius:var(--radius)}
+.kpis{display:grid;grid-template-columns:repeat(4,1fr);gap:16px}
+@media (max-width:760px){.kpis{grid-template-columns:repeat(2,1fr)}}
+.kpi{padding:20px}
+.kpi label{display:block;color:var(--muted);font-size:13.5px;margin-bottom:6px}
+.kpi b{font-size:32px;letter-spacing:-.03em;font-weight:700;font-variant-numeric:tabular-nums}
+.kpi i{font-style:normal;color:var(--muted);font-size:15px;margin-left:3px;font-weight:500}
+
+.servers{display:grid;grid-template-columns:repeat(4,1fr);gap:16px;margin-top:16px}
+@media (max-width:760px){.servers{grid-template-columns:repeat(2,1fr)}}
+.server{padding:16px 18px}
+.server .top{display:flex;align-items:center;justify-content:space-between;gap:8px}
+.server h3{font-size:15px;font-weight:650}
+.state{font-size:12.5px;font-weight:600;display:inline-flex;align-items:center;gap:6px}
+.state.running{color:var(--ok)}.state.restarting{color:var(--warn)}.state.down{color:var(--bad)}
+.server p{color:var(--muted);font-size:13.5px;margin-top:6px}
+
+.matrix-wrap{overflow-x:auto}
+table{border-collapse:collapse;width:100%;min-width:480px}
+th{font-size:13px;font-weight:600;color:var(--muted);text-align:center;padding:12px 8px;border-bottom:1px solid var(--line);background:var(--band);white-space:nowrap}
+td{padding:9px 8px;text-align:center;border-bottom:1px solid var(--line)}
+tr:last-child td{border-bottom:0}
+th:first-child,td:first-child{text-align:left;padding-left:20px}
+td:first-child{font-family:var(--mono);font-size:13px;color:var(--ink-2)}
+.chip{display:inline-flex;align-items:center;justify-content:center;min-width:28px;height:24px;padding:0 7px;border-radius:6px;font-size:12px;font-weight:700;border:1px solid transparent}
+.chip.L{background:var(--ok);color:#fff}
+.chip.F{background:var(--accent-soft);color:var(--accent);border-color:#c7d2fe}
+.chip.C{background:var(--warn-soft);color:var(--warn);border-color:#fcd34d}
+.chip.x{background:var(--bad-soft);color:var(--bad);border-color:#fca5a5}
+.none{color:var(--line-strong)}
+.legend{display:flex;flex-wrap:wrap;gap:6px 20px;padding:12px 20px;border-top:1px solid var(--line);color:var(--muted);font-size:13px}
+.legend span{display:inline-flex;align-items:center;gap:7px}
+
+/* playground */
+.grid-2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:20px}
+@media (max-width:860px){.grid-2{grid-template-columns:1fr}}
+.panel{padding:24px;display:flex;flex-direction:column;gap:16px}
+.panel h3{font-size:18px;font-weight:700;letter-spacing:-.015em}
+.panel .sub{color:var(--muted);font-size:14.5px;margin-top:2px}
+.row{display:flex;gap:10px;flex-wrap:wrap}
+.out{background:var(--band);border:1px solid var(--line);border-radius:9px;padding:14px;font-size:14px;min-height:64px;color:var(--ink-2)}
+.out .hint{color:#94a3b8}
+.err{color:var(--bad)}
+.kv{display:flex;flex-wrap:wrap;gap:6px 8px;align-items:center}
+.badge{font-family:var(--mono);font-size:12.5px;background:#fff;border:1px solid var(--line);border-radius:6px;padding:1px 8px;color:var(--ink)}
+.compare{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+@media (max-width:520px){.compare{grid-template-columns:1fr}}
+.side{background:#fff;border:1px solid var(--line);border-radius:9px;padding:12px 14px}
+.side h4{font-size:13px;font-weight:650;margin-bottom:6px}
+.side ol{margin:0;padding:0;list-style:none;font-size:13.5px;color:var(--ink-2)}
+.side li{display:flex;justify-content:space-between;padding:2px 0}
+.side li b{color:var(--ink);font-variant-numeric:tabular-nums}
+.verdict{margin-top:8px;font-size:13px;font-weight:650}
+.verdict.good{color:var(--ok)}.verdict.bad{color:var(--bad)}
+.pair{display:grid;grid-template-columns:1fr auto 1fr;gap:10px;align-items:center}
+@media (max-width:520px){.pair{grid-template-columns:1fr}.pair .join{display:none}}
+.join{color:var(--muted);font-size:12.5px;text-align:center}
+.pcard{background:#fff;border:1px solid var(--line);border-radius:9px;padding:10px 12px;font-size:13px;color:var(--muted)}
+.pcard b{display:block;color:var(--ink);font-size:14px}
+.timeline{list-style:none;margin:0;padding:0;font-size:14px}
+.timeline li{display:flex;gap:12px;padding:7px 0;border-bottom:1px solid var(--line);color:var(--ink-2)}
+.timeline li:last-child{border-bottom:0}
+.timeline time{color:var(--muted);font-size:13px;min-width:62px;font-variant-numeric:tabular-nums}
+.timeline .empty{color:#94a3b8}
+
+/* architecture */
+.flow{display:grid;grid-template-columns:repeat(4,1fr);gap:16px}
+@media (max-width:860px){.flow{grid-template-columns:repeat(2,1fr)}}
+@media (max-width:520px){.flow{grid-template-columns:1fr}}
+.step{padding:20px}
+.step .n{display:grid;place-items:center;width:28px;height:28px;border-radius:8px;background:var(--accent-soft);color:var(--accent);font-weight:700;font-size:14px;margin-bottom:12px}
+.step h3{font-size:16px;font-weight:650}
+.step p{color:var(--muted);font-size:14px;margin-top:2px}
+.pillars{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;margin-top:16px}
+@media (max-width:760px){.pillars{grid-template-columns:1fr}}
+.pillar{padding:20px}
+.pillar h3{font-size:16px;font-weight:650}
+.pillar p{color:var(--muted);font-size:14px;margin-top:2px}
+
+footer{padding:32px 0;border-top:1px solid var(--line);color:var(--muted);font-size:14px;text-align:center}
+.sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0)}
 </style>
 </head>
 <body>
-<main>
-<h1>kv-store: a live, replicated key-value store</h1>
-<p class="sub">Four real server processes running Raft consensus, partitioned into 8 shards with 3 replicas each. This page talks to the cluster through a small gateway. Everything you do here is real.</p>
-
-<section class="card">
-  <h2>Cluster <span id="status" class="note"></span></h2>
-  <div class="servers" id="servers"></div>
-  <div style="overflow-x:auto;margin-top:12px"><table id="grid"></table></div>
-  <p class="legend"><span class="c L">L</span> leader &nbsp; <span class="c F">F</span> follower &nbsp; <span class="c C">C</span> candidate &nbsp; <span class="c x">x</span> server down &nbsp; <span class="dash">-</span> not a replica. Each partition has three replicas and exactly one leader.</p>
-  <div class="stats" id="stats"></div>
-</section>
-
-<section class="card">
-  <h2>Write and read a key</h2>
-  <div class="row">
-    <input id="key" placeholder="key (letters, digits)" maxlength="40" value="hello">
-    <input id="value" placeholder="value" maxlength="200" value="world">
-    <button id="put">Set</button>
-    <button id="get" class="secondary">Get</button>
+<header class="nav">
+  <div class="wrap">
+    <a class="brand" href="#top">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><ellipse cx="12" cy="5.5" rx="8" ry="3"/><path d="M4 5.5v6c0 1.7 3.6 3 8 3s8-1.3 8-3v-6"/><path d="M4 11.5v6c0 1.7 3.6 3 8 3s8-1.3 8-3v-6"/></svg>
+      kv-store
+    </a>
+    <nav class="links" aria-label="Sections">
+      <a href="#cluster">Cluster</a><a href="#try">Try it</a><a href="#how">How it works</a>
+      <span class="pill" role="status" aria-live="polite"><span class="dot" id="statusDot"></span><span id="statusText">Connecting</span></span>
+    </nav>
   </div>
-  <pre id="kvout">Writes go to the key's partition leader, are replicated to a majority, then acknowledged.</pre>
-</section>
+</header>
 
-<section class="card">
-  <h2>Exactly-once writes</h2>
-  <p>A reply gets lost, so the client retries. With a request id the retry is recognised and not applied twice; a naive client that treats the retry as a new request counts twice.</p>
-  <button id="eo">Run the lost-reply experiment</button>
-  <pre id="eoout">Increments a shared counter.</pre>
-</section>
+<main id="top">
+  <div class="wrap hero">
+    <h1>A key-value database that survives failure.</h1>
+    <p>Replicated with Raft, partitioned across servers, running live below.</p>
+    <div class="cta"><a class="btn" href="#try">Try it</a><a class="btn ghost" href="#cluster">View cluster</a></div>
+    <div class="facts">
+      <div class="fact"><b>4</b><span>servers</span></div>
+      <div class="fact"><b>8</b><span>partitions</span></div>
+      <div class="fact"><b>3</b><span>replicas each</span></div>
+    </div>
+  </div>
 
-<section class="card">
-  <h2>Atomic transaction across partitions</h2>
-  <p>Two keys on different partitions are written together with two-phase commit, where every step is itself a Raft entry.</p>
-  <button id="txn">Write two keys atomically</button>
-  <pre id="txnout"></pre>
-</section>
+  <section id="cluster" class="band">
+    <div class="wrap">
+      <div class="head"><h2>Live cluster</h2><span class="meta" id="updated">Connecting</span></div>
+      <div class="kpis" id="kpis"></div>
+      <div class="servers" id="servers"></div>
+      <div class="card" style="margin-top:16px">
+        <div class="matrix-wrap"><table id="matrix"><caption class="sr">Role of each server in each partition</caption></table></div>
+        <div class="legend">
+          <span><i class="chip L">L</i> Leader</span><span><i class="chip F">F</i> Follower</span>
+          <span><i class="chip C">C</i> Candidate</span><span><i class="chip x">x</i> Down</span>
+          <span><i class="none">–</i> Not a replica</span>
+        </div>
+      </div>
+    </div>
+  </section>
 
-<section class="card" id="chaoscard">
-  <h2>Break it</h2>
-  <p>Crash a server with <code>kill -9</code>. Watch leaders move in the table above while reads and writes keep working. It restarts by itself after a few seconds and catches up from its peers.</p>
-  <div class="row" id="kills"></div>
-  <ul class="events" id="events"></ul>
-</section>
+  <section id="try">
+    <div class="wrap">
+      <div class="head"><h2>Try it</h2><p>Shared demo. Requests are rate limited.</p></div>
+      <div class="grid-2">
 
-<section class="card">
-  <h2>How it works</h2>
-  <ul class="how">
-    <li><b>Storage:</b> an LSM tree (write-ahead log, memtable, SSTables with bloom filters, compaction).</li>
-    <li><b>Consensus:</b> Raft per partition: elections, log replication, snapshots, linearizable reads.</li>
-    <li><b>Sharding:</b> consistent hashing places 8 fixed partitions on servers; a routing table with epochs keeps everyone in agreement; partitions move online through Raft membership changes.</li>
-    <li><b>Transactions:</b> two-phase commit across partitions, with the decision stored in a Raft log so a crashed coordinator cannot block anyone.</li>
-    <li><b>Reliability:</b> request ids make retries exactly-once; overload answers BUSY before anything is written; a chaos tester kills real processes and checks the guarantees.</li>
-  </ul>
-  <p class="note" style="margin-top:10px">This demo is rate limited and keeps data in memory-sized, throw-away storage.</p>
-</section>
+        <article class="card panel">
+          <div><h3>Write and read</h3><p class="sub">Stored on the key's partition, replicated to a majority.</p></div>
+          <div class="row">
+            <input id="key" placeholder="Key" maxlength="40" value="hello" aria-label="Key" autocomplete="off">
+            <input id="value" placeholder="Value" maxlength="200" value="world" aria-label="Value" autocomplete="off">
+          </div>
+          <div class="row"><button class="btn small" id="put">Set</button><button class="btn small ghost" id="get">Get</button></div>
+          <div class="out" id="kvout" aria-live="polite"><span class="hint">Result appears here.</span></div>
+        </article>
+
+        <article class="card panel">
+          <div><h3>Exactly-once</h3><p class="sub">A reply is lost and the client retries.</p></div>
+          <div class="row"><button class="btn small" id="eo">Replay a lost reply</button></div>
+          <div class="out" id="eoout" aria-live="polite"><span class="hint">Result appears here.</span></div>
+        </article>
+
+        <article class="card panel">
+          <div><h3>Transaction</h3><p class="sub">Two partitions, one atomic commit.</p></div>
+          <div class="row"><button class="btn small" id="txn">Write two keys</button></div>
+          <div class="out" id="txnout" aria-live="polite"><span class="hint">Result appears here.</span></div>
+        </article>
+
+        <article class="card panel" id="chaoscard">
+          <div><h3>Failover</h3><p class="sub">Crash a server and watch leaders move.</p></div>
+          <div class="row" id="kills"></div>
+          <ul class="timeline" id="events"><li class="empty">No events yet.</li></ul>
+        </article>
+
+      </div>
+    </div>
+  </section>
+
+  <section id="how" class="band">
+    <div class="wrap">
+      <div class="head"><h2>How a write travels</h2></div>
+      <div class="flow">
+        <div class="card step"><div class="n">1</div><h3>Any server</h3><p>Hashes the key to a partition.</p></div>
+        <div class="card step"><div class="n">2</div><h3>Partition leader</h3><p>Receives the forwarded request.</p></div>
+        <div class="card step"><div class="n">3</div><h3>Raft log</h3><p>A majority makes it durable.</p></div>
+        <div class="card step"><div class="n">4</div><h3>Storage engine</h3><p>Applied to an LSM tree.</p></div>
+      </div>
+      <div class="pillars">
+        <div class="card pillar"><h3>Fault tolerant</h3><p>Leaders are re-elected automatically.</p></div>
+        <div class="card pillar"><h3>Online rebalancing</h3><p>Partitions move without downtime.</p></div>
+        <div class="card pillar"><h3>Safe retries</h3><p>Request ids make writes exactly-once.</p></div>
+      </div>
+    </div>
+  </section>
 </main>
+
+<footer><div class="wrap">&copy; 2026 baijuyadav2026</div></footer>
+
 <script>
-const $ = id => document.getElementById(id);
-const esc = s => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-async function api(path, options) {
-  const res = await fetch(path, options);
-  const body = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(body.error || res.statusText);
-  return body;
-}
-const cellHtml = c => c === '-' ? '<span class="dash">-</span>' : '<span class="c ' + esc(c) + '">' + esc(c) + '</span>';
+(function () {
+  'use strict';
+  const $ = id => document.getElementById(id);
+  const esc = s => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 
-function render(data) {
-  $('status').textContent = data.ready ? '(all partitions have a leader)' : '(electing leaders...)';
-  $('servers').innerHTML = data.servers.map(s =>
-    '<div class="server"><b>server ' + s.id + '</b><span class="badge ' + esc(s.state) + '">' + esc(s.state) + '</span>' +
-    '<div class="note">hosts ' + s.hosting + ' partitions</div></div>').join('');
-  const ids = data.servers.map(s => s.id);
-  $('grid').innerHTML = '<tr><th>partition</th>' + ids.map(i => '<th>server ' + i + '</th>').join('') + '</tr>' +
-    data.grid.map(r => '<tr><td>p' + r.partition + '</td>' + ids.map(i => '<td>' + cellHtml(r.cells[i] || '-') + '</td>').join('') + '</tr>').join('');
-  const st = data.stats;
-  const stat = (label, value) => '<div class="stat"><span>' + label + '</span><b>' + value + '</b></div>';
-  $('stats').innerHTML = stat('routing epoch', data.epoch) + stat('elections', st.elections) +
-    stat('writes committed', st.commits) + stat('avg commit', st.avg_commit_ms.toFixed(1) + ' ms') +
-    stat('retries deduplicated', st.duplicates_avoided);
-  $('chaoscard').style.display = data.chaos ? '' : 'none';
-  $('kills').innerHTML = data.servers.map(s =>
-    '<button class="danger" data-kill="' + s.id + '"' + (s.state !== 'running' ? ' disabled' : '') + '>Kill server ' + s.id + '</button>').join('');
-  $('events').innerHTML = data.events.map(e => '<li>' + e.ago + ' s ago: ' + esc(e.text) + '</li>').join('');
-}
+  async function api(path, options) {
+    const res = await fetch(path, options);
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(body.error || res.statusText);
+    return body;
+  }
 
-async function refresh() {
-  try { render(await api('/api/cluster')); }
-  catch (e) { $('status').textContent = '(' + e.message + ')'; }
-}
+  async function busy(button, work) {
+    button.disabled = true;
+    button.classList.add('busy');
+    try { await work(); }
+    finally { button.disabled = false; button.classList.remove('busy'); }
+  }
 
-$('put').onclick = async () => {
-  $('kvout').textContent = 'writing...';
-  try {
-    const r = await api('/api/kv', {method: 'PUT', headers: {'content-type': 'application/json'},
-      body: JSON.stringify({key: $('key').value, value: $('value').value})});
-    $('kvout').textContent = 'OK: "' + r.key + '" is stored on partition ' + r.partition + ', replicas on servers ' + r.replicas.join(', ');
-  } catch (e) { $('kvout').textContent = 'error: ' + e.message; }
-};
-$('get').onclick = async () => {
-  try {
-    const r = await api('/api/kv?key=' + encodeURIComponent($('key').value));
-    $('kvout').textContent = (r.value === null ? '"' + r.key + '" not found' : '"' + r.key + '" = "' + r.value + '"') +
-      '  (partition ' + r.partition + ', replicas on servers ' + r.replicas.join(', ') + ')';
-  } catch (e) { $('kvout').textContent = 'error: ' + e.message; }
-};
-$('eo').onclick = async () => {
-  $('eoout').textContent = 'running...';
-  try {
-    const r = await api('/api/demo/exactly-once', {method: 'POST'});
-    const p = r.protected, n = r.naive;
-    $('eoout').textContent =
-      'WITH a request id\n  attempt 1 returned          ' + p.first_attempt + '\n  retry after a "lost reply"  ' + p.retry_after_lost_reply +
-      '   <- same answer, counted once: ' + (p.first_attempt === p.retry_after_lost_reply ? 'yes' : 'no') +
-      '\n\nWITHOUT (the retry is a new request)\n  attempt 1 returned          ' + n.first_attempt + '\n  retry returned              ' + n.retry_as_new_request +
-      '   <- counted twice\n\ncounter now: ' + r.counter_now;
-  } catch (e) { $('eoout').textContent = 'error: ' + e.message; }
-};
-$('txn').onclick = async () => {
-  $('txnout').textContent = 'running...';
-  try {
-    const r = await api('/api/demo/transaction', {method: 'POST'});
-    $('txnout').textContent = 'committed value ' + r.value + '\n  ' + r.first.key + ' on partition ' + r.first.partition + ' (servers ' + r.first.replicas.join(', ') +
-      ') reads back ' + r.first.read_back + '\n  ' + r.second.key + ' on partition ' + r.second.partition + ' (servers ' + r.second.replicas.join(', ') + ') reads back ' + r.second.read_back;
-  } catch (e) { $('txnout').textContent = 'error: ' + e.message; }
-};
-$('kills').onclick = async ev => {
-  const id = ev.target.dataset && ev.target.dataset.kill;
-  if (!id) return;
-  try { await api('/api/chaos/kill/' + id, {method: 'POST'}); }
-  catch (e) { $('events').insertAdjacentHTML('afterbegin', '<li>' + esc(e.message) + '</li>'); }
+  const showError = (el, e) => { el.innerHTML = '<span class="err">' + esc(e.message) + '</span>'; };
+  const servers = list => list.map(s => '<span class="badge">server ' + esc(s) + '</span>').join(' ');
+  const placement = r => '<span class="badge">partition ' + esc(r.partition) + '</span> ' + servers(r.replicas);
+
+  function setStatus(kind, text) {
+    $('statusDot').className = 'dot ' + kind;
+    $('statusText').textContent = text;
+  }
+
+  const chip = c => c === '-' ? '<span class="none" aria-label="not a replica">–</span>'
+    : '<span class="chip ' + esc(c) + '" title="' + ({L:'Leader',F:'Follower',C:'Candidate',x:'Down'}[c] || '') + '">' + esc(c) + '</span>';
+
+  function render(data) {
+    const up = data.servers.filter(s => s.up).length;
+    const led = data.grid.filter(r => r.leader !== null).length;
+    setStatus(data.ready ? 'ok' : 'warn', data.ready ? 'Operational' : 'Electing leaders');
+    $('updated').textContent = 'Routing epoch ' + data.epoch + ' · updated ' + new Date().toLocaleTimeString();
+
+    const st = data.stats;
+    const kpi = (label, value, unit) => '<div class="card kpi"><label>' + label + '</label><b>' + value + '</b>' + (unit ? '<i>' + unit + '</i>' : '') + '</div>';
+    $('kpis').innerHTML =
+      kpi('Servers up', up + '/' + data.servers.length) + kpi('Partitions led', led + '/' + data.partitions) +
+      kpi('Writes committed', st.commits) + kpi('Average commit', st.avg_commit_ms.toFixed(1), 'ms');
+
+    $('servers').innerHTML = data.servers.map(s => {
+      const leads = data.grid.filter(r => r.leader === s.id).length;
+      const kind = s.state === 'running' ? 'ok' : s.state === 'restarting' ? 'warn' : 'bad';
+      return '<div class="card server"><div class="top"><h3>Server ' + esc(s.id) + '</h3><span class="state ' + esc(s.state) + '"><span class="dot ' + kind + '"></span>' + esc(s.state) + '</span></div>' +
+        '<p>' + esc(s.hosting) + ' replicas · ' + leads + ' leading</p></div>';
+    }).join('');
+
+    const ids = data.servers.map(s => s.id);
+    $('matrix').innerHTML = '<caption class="sr">Role of each server in each partition</caption>' +
+      '<thead><tr><th scope="col">Partition</th>' + ids.map(i => '<th scope="col">Server ' + esc(i) + '</th>').join('') + '</tr></thead><tbody>' +
+      data.grid.map(r => '<tr><td>p' + esc(r.partition) + '</td>' + ids.map(i => '<td>' + chip(r.cells[i] || '-') + '</td>').join('') + '</tr>').join('') + '</tbody>';
+
+    $('chaoscard').style.display = data.chaos ? '' : 'none';
+    const anyDown = data.servers.some(s => s.state !== 'running');
+    $('kills').innerHTML = data.servers.map(s =>
+      '<button class="btn small danger" data-kill="' + esc(s.id) + '"' + (anyDown ? ' disabled' : '') + '>Crash server ' + esc(s.id) + '</button>').join('');
+
+    $('events').innerHTML = data.events.length
+      ? data.events.map(e => '<li><time>' + esc(e.ago) + ' s ago</time><span>' + esc(e.text) + '</span></li>').join('')
+      : '<li class="empty">No events yet.</li>';
+  }
+
+  let inFlight = false;
+  async function refresh() {
+    if (inFlight) return;
+    inFlight = true;
+    try { render(await api('/api/cluster')); }
+    catch (e) { setStatus('bad', 'Unreachable'); }
+    finally { inFlight = false; }
+  }
+
+  $('put').onclick = ev => busy(ev.currentTarget, async () => {
+    try {
+      const r = await api('/api/kv', {method: 'PUT', headers: {'content-type': 'application/json'},
+        body: JSON.stringify({key: $('key').value, value: $('value').value})});
+      $('kvout').innerHTML = '<div class="kv"><b>Stored</b><span class="badge">' + esc(r.key) + '</span> on ' + placement(r) + '</div>';
+    } catch (e) { showError($('kvout'), e); }
+  });
+
+  $('get').onclick = ev => busy(ev.currentTarget, async () => {
+    try {
+      const r = await api('/api/kv?key=' + encodeURIComponent($('key').value));
+      $('kvout').innerHTML = '<div class="kv"><span class="badge">' + esc(r.key) + '</span> ' +
+        (r.value === null ? '<b>not found</b>' : '= <span class="badge">' + esc(r.value) + '</span>') + ' · ' + placement(r) + '</div>';
+    } catch (e) { showError($('kvout'), e); }
+  });
+
+  $('eo').onclick = ev => busy(ev.currentTarget, async () => {
+    try {
+      const r = await api('/api/demo/exactly-once', {method: 'POST'});
+      const p = r.protected, n = r.naive;
+      const once = p.first_attempt === p.retry_after_lost_reply;
+      $('eoout').innerHTML = '<div class="compare">' +
+        '<div class="side"><h4>With request id</h4><ol><li>Attempt <b>' + esc(p.first_attempt) + '</b></li><li>Retry <b>' + esc(p.retry_after_lost_reply) + '</b></li></ol>' +
+        '<div class="verdict ' + (once ? 'good' : 'bad') + '">' + (once ? '✓ Counted once' : '✗ Counted twice') + '</div></div>' +
+        '<div class="side"><h4>Without</h4><ol><li>Attempt <b>' + esc(n.first_attempt) + '</b></li><li>Retry <b>' + esc(n.retry_as_new_request) + '</b></li></ol>' +
+        '<div class="verdict bad">✗ Counted twice</div></div></div>';
+    } catch (e) { showError($('eoout'), e); }
+  });
+
+  $('txn').onclick = ev => busy(ev.currentTarget, async () => {
+    try {
+      const r = await api('/api/demo/transaction', {method: 'POST'});
+      const card = k => '<div class="pcard"><b>' + esc(k.key) + ' = ' + esc(k.read_back) + '</b>partition ' + esc(k.partition) + ' · servers ' + esc(k.replicas.join(', ')) + '</div>';
+      $('txnout').innerHTML = '<div class="pair">' + card(r.first) + '<div class="join">committed<br>together</div>' + card(r.second) + '</div>';
+    } catch (e) { showError($('txnout'), e); }
+  });
+
+  $('kills').onclick = async ev => {
+    const button = ev.target.closest('button[data-kill]');
+    if (!button || button.disabled) return;
+    try { await api('/api/chaos/kill/' + encodeURIComponent(button.dataset.kill), {method: 'POST'}); }
+    catch (e) { $('events').insertAdjacentHTML('afterbegin', '<li><time>now</time><span class="err">' + esc(e.message) + '</span></li>'); }
+    refresh();
+  };
+
   refresh();
-};
-refresh(); setInterval(refresh, 1000);
+  setInterval(refresh, 1000);
+})();
 </script>
 </body>
 </html>
