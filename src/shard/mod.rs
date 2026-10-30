@@ -1,4 +1,4 @@
-//! V10: partitioning (sharding) on top of Raft.
+//! Partitioning (sharding) on top of Raft.
 
 pub mod cluster;
 pub mod hash;

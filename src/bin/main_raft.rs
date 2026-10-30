@@ -1,4 +1,4 @@
-//! V9: one node of a 3-node Raft cluster.
+//! One node of a three-node Raft cluster.
 
 use std::collections::HashMap;
 use std::io;

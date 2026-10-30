@@ -1,4 +1,4 @@
-//! The V11 client request line: a command, optionally tagged with a request id.
+//! The client request line: a command, optionally tagged with a request id.
 
 use crate::net::protocol::{Command, parse_request};
 use crate::raft::session::valid_client_id;
